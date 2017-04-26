@@ -1,0 +1,4200 @@
+<!doctype html>
+<html manifest="player.manifest">
+  <head>
+    <title>MP3 Player</title>
+    
+    <link rel="icon"  type="image/png" href="16.png">
+       <!-- WebMidiAPI polyfill -->
+ <script id='../http//cwilso.github.io/WebMIDIAPIShim/lib/WebMIDIAPI.js'>
+ /* Copyright 2013 Chris Wilson
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+// Initialize the MIDI library.
+(function (global) {
+    'use strict';
+    var midiIO, 
+        _requestMIDIAccess, 
+        MIDIAccess, 
+        _onReady, 
+        MIDIPort, 
+        MIDIInput, 
+        MIDIOutput, 
+        _midiProc;
+
+    function Promise() {}
+
+    Promise.prototype.then = function(accept, reject) {
+        this.accept = accept; 
+        this.reject = reject;
+    }
+
+    Promise.prototype.succeed = function(access) {
+        if (this.accept)
+            this.accept(access);
+    }
+
+    Promise.prototype.fail = function(error) {
+        if (this.reject)
+            this.reject(error);
+    }
+////////////////////////////////////////////////
+    function _JazzInstance() {
+        this.inputInUse = false;
+        this.outputInUse = false;
+
+        // load the Jazz plugin
+        var o1 = document.createElement("object");
+        o1.id = "_Jazz" + Math.random() + "ie";
+        o1.classid = "CLSID:1ACE1618-1C7D-4561-AEE1-34842AA85E90";
+
+        this.activeX = o1;
+
+        var o2 = document.createElement("object");
+        o2.id = "_Jazz" + Math.random();
+        o2.type="audio/x-jazz";
+        o1.appendChild(o2);
+
+        this.objRef = o2;
+
+        var e = document.createElement("p");
+        e.appendChild(document.createTextNode("This page requires the "));
+
+        var a = document.createElement("a");
+        a.appendChild(document.createTextNode("Jazz plugin"));
+        a.href = "http://jazz-soft.net/";
+
+        e.appendChild(a);
+        e.appendChild(document.createTextNode("."));
+        o2.appendChild(e);
+
+        var insertionPoint = document.getElementById("MIDIPlugin");
+        if (!insertionPoint) {
+            // Create hidden element
+            var insertionPoint = document.createElement("div");
+            insertionPoint.id = "MIDIPlugin";
+            insertionPoint.style.position = "absolute";
+            insertionPoint.style.visibility = "hidden";
+            insertionPoint.style.left = "-9999px";
+            insertionPoint.style.top = "-9999px";
+            document.body.appendChild(insertionPoint);
+        }
+        insertionPoint.appendChild(o1);
+
+        if (this.objRef.isJazz)
+            this._Jazz = this.objRef;
+        else if (this.activeX.isJazz)
+            this._Jazz = this.activeX;
+        else
+            this._Jazz = null;
+        if (this._Jazz) {
+            this._Jazz._jazzTimeZero = this._Jazz.Time();
+            this._Jazz._perfTimeZero = window.performance.now();
+        }
+    }
+/////////////////////////////////////////////////////////////////
+    _requestMIDIAccess = function _requestMIDIAccess() {
+        var access = new MIDIAccess();
+        return access._promise;
+    };
+
+    // API Methods
+
+    function MIDIAccess() {
+        this._jazzInstances = new Array();
+        this._jazzInstances.push( new _JazzInstance() );
+        this._promise = new Promise;
+
+        if (this._jazzInstances[0]._Jazz) {
+            this._Jazz = this._jazzInstances[0]._Jazz;
+            window.setTimeout( _onReady.bind(this), 3 );
+        } else {
+            window.setTimeout( _onNotReady.bind(this), 3 );
+        }
+    };
+
+    _onReady = function _onReady() {
+        if (this._promise)
+            this._promise.succeed(this);
+    };
+
+    function _onNotReady() {
+        if (this._promise)
+            this._promise.fail( { code: 1 } );
+    };
+
+    MIDIAccess.prototype.inputs = function(  ) {
+        if (!this._Jazz)
+              return null;
+        var list=this._Jazz.MidiInList();
+        var inputs = new Array( list.length );
+
+        for ( var i=0; i<list.length; i++ ) {
+            inputs[i] = new MIDIInput( this, list[i], i );
+        }
+        return inputs;
+    }
+
+    MIDIAccess.prototype.outputs = function(  ) {
+        if (!this._Jazz)
+            return null;
+        var list=this._Jazz.MidiOutList();
+        var outputs = new Array( list.length );
+
+        for ( var i=0; i<list.length; i++ ) {
+            outputs[i] = new MIDIOutput( this, list[i], i );
+        }
+        return outputs;
+    };
+
+    MIDIInput = function MIDIInput( midiAccess, name, index ) {
+        this._listeners = [];
+        this._midiAccess = midiAccess;
+        this._index = index;
+        this._inLongSysexMessage = false;
+        this._sysexBuffer = new Uint8Array();
+        this.id = "" + index + "." + name;
+        this.manufacturer = "";
+        this.name = name;
+        this.type = "input";
+        this.version = "";
+        this.onmidimessage = null;
+
+        var inputInstance = null;
+        for (var i=0; (i<midiAccess._jazzInstances.length)&&(!inputInstance); i++) {
+            if (!midiAccess._jazzInstances[i].inputInUse)
+                inputInstance=midiAccess._jazzInstances[i];
+        }
+        if (!inputInstance) {
+            inputInstance = new _JazzInstance();
+            midiAccess._jazzInstances.push( inputInstance );
+        }
+        inputInstance.inputInUse = true;
+
+        this._jazzInstance = inputInstance._Jazz;
+        this._input = this._jazzInstance.MidiInOpen( this._index, _midiProc.bind(this) );
+    };
+
+    // Introduced in DOM Level 2:
+    MIDIInput.prototype.addEventListener = function (type, listener, useCapture ) {
+        if (type !== "midimessage")
+            return;
+        for (var i=0; i<this._listeners.length; i++)
+            if (this._listeners[i] == listener)
+                return;
+        this._listeners.push( listener );
+    };
+
+    MIDIInput.prototype.removeEventListener = function (type, listener, useCapture ) {
+        if (type !== "midimessage")
+            return;
+        for (var i=0; i<this._listeners.length; i++)
+            if (this._listeners[i] == listener) {
+                this._listeners.splice( i, 1 );  //remove it
+                return;
+            }
+    };
+
+    MIDIInput.prototype.preventDefault = function() {
+        this._pvtDef = true;
+    };
+
+    MIDIInput.prototype.dispatchEvent = function (evt) {
+        this._pvtDef = false;
+
+        // dispatch to listeners
+        for (var i=0; i<this._listeners.length; i++)
+            if (this._listeners[i].handleEvent)
+                this._listeners[i].handleEvent.bind(this)( evt );
+            else
+                this._listeners[i].bind(this)( evt );
+
+        if (this.onmidimessage)
+            this.onmidimessage( evt );
+
+        return this._pvtDef;
+    };
+
+    MIDIInput.prototype.appendToSysexBuffer = function ( data ) {
+        var oldLength = this._sysexBuffer.length;
+        var tmpBuffer = new Uint8Array( oldLength + data.length );
+        tmpBuffer.set( this._sysexBuffer );
+        tmpBuffer.set( data, oldLength );
+        this._sysexBuffer = tmpBuffer;
+    };
+
+    MIDIInput.prototype.bufferLongSysex = function ( data, initialOffset ) {
+        var j = initialOffset;
+        while (j<data.length) {
+            if (data[j] == 0xF7) {
+                // end of sysex!
+                j++;
+                this.appendToSysexBuffer( data.slice(initialOffset, j) );
+                return j;
+            }
+            j++;
+        }
+        // didn't reach the end; just tack it on.
+        this.appendToSysexBuffer( data.slice(initialOffset, j) );
+        this._inLongSysexMessage = true;
+        return j;
+    };
+
+    _midiProc = function _midiProc( timestamp, data ) {
+        // Have to use createEvent/initEvent because IE10 fails on new CustomEvent.  Thanks, IE!
+        var length = 0;
+        var i,j;
+        var isSysexMessage = false;
+
+        // Jazz sometimes passes us multiple messages at once, so we need to parse them out
+        // and pass them one at a time.
+
+        for (i=0; i<data.length; i+=length) {
+            if (this._inLongSysexMessage) {
+                i = this.bufferLongSysex(data,i);
+                if ( data[i-1] != 0xf7 ) {
+                    // ran off the end without hitting the end of the sysex message
+                    return;
+                }
+                isSysexMessage = true;
+            } 
+            else {
+                isSysexMessage = false;
+                switch (data[i] & 0xF0) {
+                    case 0x80:  // note off
+                    case 0x90:  // note on
+                    case 0xA0:  // polyphonic aftertouch
+                    case 0xB0:  // control change
+                    case 0xE0:  // channel mode
+                        length = 3;
+                        break;
+
+                    case 0xC0:  // program change
+                    case 0xD0:  // channel aftertouch
+                        length = 2;
+                        break;
+
+                    case 0xF0:
+                        switch (data[i]) {
+                            case 0xf0:  // variable-length sysex.
+                                i = this.bufferLongSysex(data,i);
+                                if ( data[i-1] != 0xf7 ) {
+                                    // ran off the end without hitting the end of the sysex message
+                                    return;
+                                }
+                                isSysexMessage = true;
+                                break;
+
+                            case 0xF1:  // MTC quarter frame
+                            case 0xF3:  // song select
+                                length = 2;
+                                break;
+
+                            case 0xF2:  // song position pointer
+                                length = 3;
+                                break;
+
+                            default:
+                                length = 1;
+                                break;
+                        }
+                        break;
+                }
+            }
+            var evt = document.createEvent( "Event" );
+            evt.initEvent( "midimessage", false, false );
+            evt.receivedTime = parseFloat( timestamp.toString()) + this._jazzInstance._perfTimeZero;
+            if (isSysexMessage || this._inLongSysexMessage) {
+                evt.data = new Uint8Array( this._sysexBuffer );
+                this._sysexBuffer.length = 0;
+                this._inLongSysexMessage = false;
+            } else
+                evt.data = new Uint8Array(data.slice(i, length+i));
+            this.dispatchEvent( evt );
+        }
+    };
+
+    MIDIOutput = function MIDIOutput( midiAccess, name, index ) {
+        this._listeners = [];
+        this._midiAccess = midiAccess;
+        this._index = index;
+        this.id = "" + index + "." + name;
+        this.manufacturer = "";
+        this.name = name;
+        this.type = "output";
+        this.version = "";
+
+        var outputInstance = null;
+        for (var i=0; (i<midiAccess._jazzInstances.length)&&(!outputInstance); i++) {
+            if (!midiAccess._jazzInstances[i].outputInUse)
+                outputInstance=midiAccess._jazzInstances[i];
+        }
+        if (!outputInstance) {
+            outputInstance = new _JazzInstance();
+            midiAccess._jazzInstances.push( outputInstance );
+        }
+        outputInstance.outputInUse = true;
+
+        this._jazzInstance = outputInstance._Jazz;
+        this._jazzInstance.MidiOutOpen(this.name);
+    };
+
+    function _sendLater() {
+        this.jazz.MidiOutLong( this.data );    // handle send as sysex
+    }
+
+    MIDIOutput.prototype.send = function( data, timestamp ) {
+        var delayBeforeSend = 0;
+        if (data.length === 0)
+            return false;
+
+        if (timestamp)
+            delayBeforeSend = Math.floor( timestamp - window.performance.now() );
+
+        if (timestamp && (delayBeforeSend>1)) {
+            var sendObj = new Object();
+            sendObj.jazz = this._jazzInstance;
+            sendObj.data = data;
+
+            window.setTimeout( _sendLater.bind(sendObj), delayBeforeSend );
+        } else {
+            this._jazzInstance.MidiOutLong( data );
+        }
+        return true;
+    };
+
+    //init: create plugin
+    if (!window.navigator.requestMIDIAccess)
+        window.navigator.requestMIDIAccess = _requestMIDIAccess;
+
+}(window));
+
+// Polyfill window.performance.now() if necessary.
+(function (exports) {
+    var perf = {},
+        props;
+
+    function findAlt() {
+        var prefix = ['moz', 'webkit', 'o', 'ms'],
+        i = prefix.length,
+            //worst case, we use Date.now()
+            props = {
+                value: (function (start) {
+                    return function () {
+                        return Date.now() - start;
+                    };
+                }(Date.now()))
+            };
+
+        //seach for vendor prefixed version
+        for (; i >= 0; i--) {
+            if ((prefix[i] + "Now") in exports.performance) {
+                props.value = function (method) {
+                    return function () {
+                        exports.performance[method]();
+                    }
+                }(prefix[i] + "Now");
+                return props;
+            }
+        }
+
+        //otherwise, try to use connectionStart
+        if ("timing" in exports.performance && "connectStart" in exports.performance.timing) {
+            //this pretty much approximates performance.now() to the millisecond
+            props.value = (function (start) {
+                return function() {
+                    Date.now() - start;
+                };
+            }(exports.performance.timing.connectStart));
+        }
+        return props;
+    }
+
+    //if already defined, bail
+    if (("performance" in exports) && ("now" in exports.performance))
+        return;
+    if (!("performance" in exports))
+        Object.defineProperty(exports, "performance", {
+            get: function () {
+                return perf;
+            }});
+        //otherwise, performance is there, but not "now()"
+
+    props = findAlt();
+    Object.defineProperty(exports.performance, "now", props);
+}(window));
+
+
+ </script>
+ <!-- MIDIFile: Repos folder must be in the same parent folder than the MIDIPlayer one -->
+ <script id="../../MIDIFile/dist/MIDIFile.js" type="text/javascript">
+ (function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.MIDIFile = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+'use strict';
+
+// MIDIEvents : Read and edit events from various sources (ArrayBuffer, Stream)
+function MIDIEvents() {
+  throw new Error('MIDIEvents function not intended to be run.');
+}
+
+// Static constants
+// Event types
+MIDIEvents.EVENT_META = 0xFF;
+MIDIEvents.EVENT_SYSEX = 0xF0;
+MIDIEvents.EVENT_DIVSYSEX = 0xF7;
+MIDIEvents.EVENT_MIDI = 0x8;
+// Meta event types
+MIDIEvents.EVENT_META_SEQUENCE_NUMBER = 0x00;
+MIDIEvents.EVENT_META_TEXT = 0x01;
+MIDIEvents.EVENT_META_COPYRIGHT_NOTICE = 0x02;
+MIDIEvents.EVENT_META_TRACK_NAME = 0x03;
+MIDIEvents.EVENT_META_INSTRUMENT_NAME = 0x04;
+MIDIEvents.EVENT_META_LYRICS = 0x05;
+MIDIEvents.EVENT_META_MARKER = 0x06;
+MIDIEvents.EVENT_META_CUE_POINT = 0x07;
+MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX = 0x20;
+MIDIEvents.EVENT_META_END_OF_TRACK = 0x2F;
+MIDIEvents.EVENT_META_SET_TEMPO = 0x51;
+MIDIEvents.EVENT_META_SMTPE_OFFSET = 0x54;
+MIDIEvents.EVENT_META_TIME_SIGNATURE = 0x58;
+MIDIEvents.EVENT_META_KEY_SIGNATURE = 0x59;
+MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC = 0x7F;
+// MIDI event types
+MIDIEvents.EVENT_MIDI_NOTE_OFF = 0x8;
+MIDIEvents.EVENT_MIDI_NOTE_ON = 0x9;
+MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH = 0xA;
+MIDIEvents.EVENT_MIDI_CONTROLLER = 0xB;
+MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE = 0xC;
+MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH = 0xD;
+MIDIEvents.EVENT_MIDI_PITCH_BEND = 0xE;
+// MIDI event sizes
+MIDIEvents.MIDI_1PARAM_EVENTS = [
+  MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE,
+  MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH,
+];
+MIDIEvents.MIDI_2PARAMS_EVENTS = [
+  MIDIEvents.EVENT_MIDI_NOTE_OFF,
+  MIDIEvents.EVENT_MIDI_NOTE_ON,
+  MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH,
+  MIDIEvents.EVENT_MIDI_CONTROLLER,
+  MIDIEvents.EVENT_MIDI_PITCH_BEND,
+];
+
+// Create an event stream parser
+MIDIEvents.createParser = function midiEventsCreateParser(stream, startAt, strictMode) {
+  // Private vars
+  // Common vars
+  var eventTypeByte;
+  var event;
+  // MIDI events vars
+  var MIDIEventType;
+  var MIDIEventChannel;
+  var MIDIEventParam1;
+
+  // Wrap DataView into a data stream
+  if(stream instanceof DataView) {
+    stream = {
+      position: startAt || 0,
+      buffer: stream,
+      readUint8: function() {
+        return this.buffer.getUint8(this.position++);
+      },
+      readUint16: function() {
+        var v = this.buffer.getUint16(this.position);
+        this.position = this.position + 2;
+        return v;
+      },
+      readUint32: function() {
+        var v = this.buffer.getUint16(this.position);
+        this.position = this.position + 2;
+        return v;
+      },
+      readVarInt: function() {
+        var v = 0;
+        var i = 0;
+        var b;
+
+        while(4 > i++) {
+          b = this.readUint8();
+
+          if (b & 0x80) {
+            v += (b & 0x7f);
+            v <<= 7;
+          } else {
+            return v + b;
+          }
+        }
+        throw new Error('0x' + this.position.toString(16) + ':' +
+          ' Variable integer length cannot exceed 4 bytes');
+      },
+      readBytes: function(length) {
+        var bytes = [];
+
+        for(; 0 < length; length--) {
+          bytes.push(this.readUint8());
+        }
+        return bytes;
+      },
+      pos: function() {
+        return '0x' + (this.buffer.byteOffset + this.position).toString(16);
+      },
+      end: function() {
+        return this.position === this.buffer.byteLength;
+      },
+    };
+    startAt = 0;
+  }
+  // Consume stream till not at start index
+  if(0 < startAt) {
+    while(startAt--) {
+      stream.readUint8();
+    }
+  }
+  // creating the parser object
+  return {
+    // Read the next event
+    next: function() {
+      // Check available datas
+      if(stream.end()) {
+        return null;
+      }
+      // Creating the event
+      event = {
+        // Memoize the event index
+        index: stream.pos(),
+        // Read the delta time
+        delta: stream.readVarInt(),
+      };
+      // Read the eventTypeByte
+      eventTypeByte = stream.readUint8();
+      if(0xF0 === (eventTypeByte & 0xF0)) {
+        // Meta events
+        if(eventTypeByte === MIDIEvents.EVENT_META) {
+          event.type = MIDIEvents.EVENT_META;
+          event.subtype = stream.readUint8();
+          event.length = stream.readVarInt();
+          switch(event.subtype) {
+            case MIDIEvents.EVENT_META_SEQUENCE_NUMBER:
+              if(strictMode && 2 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.msb = stream.readUint8();
+              event.lsb = stream.readUint8();
+              return event;
+            case MIDIEvents.EVENT_META_TEXT:
+            case MIDIEvents.EVENT_META_COPYRIGHT_NOTICE:
+            case MIDIEvents.EVENT_META_TRACK_NAME:
+            case MIDIEvents.EVENT_META_INSTRUMENT_NAME:
+            case MIDIEvents.EVENT_META_LYRICS:
+            case MIDIEvents.EVENT_META_MARKER:
+            case MIDIEvents.EVENT_META_CUE_POINT:
+              event.data = stream.readBytes(event.length);
+              return event;
+            case MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX:
+              if(strictMode && 1 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.prefix = stream.readUint8();
+              return event;
+            case MIDIEvents.EVENT_META_END_OF_TRACK:
+              if(strictMode && 0 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              return event;
+            case MIDIEvents.EVENT_META_SET_TEMPO:
+              if(strictMode && 3 !== event.length) {
+                throw new Error(stream.pos() + ' Tempo meta event length must be 3.');
+              }
+              event.tempo = (
+                (stream.readUint8() << 16) +
+                (stream.readUint8() << 8) +
+                stream.readUint8()
+              );
+              event.tempoBPM = 60000000 / event.tempo;
+              return event;
+            case MIDIEvents.EVENT_META_SMTPE_OFFSET:
+              if(strictMode && 5 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.hour = stream.readUint8();
+              if(strictMode && 23 < event.hour) {
+                throw new Error(stream.pos() + ' SMTPE offset hour value must' +
+                  ' be part of 0-23.');
+              }
+              event.minutes = stream.readUint8();
+              if(strictMode && 59 < event.minutes) {
+                throw new Error(stream.pos() + ' SMTPE offset minutes value' +
+                  ' must be part of 0-59.');
+              }
+              event.seconds = stream.readUint8();
+              if(strictMode && 59 < event.seconds) {
+                throw new Error(stream.pos() + ' SMTPE offset seconds value' +
+                  ' must be part of 0-59.');
+              }
+              event.frames = stream.readUint8();
+              if(strictMode && 30 < event.frames) {
+                throw new Error(stream.pos() + ' SMTPE offset frames value must' +
+                  ' be part of 0-30.');
+              }
+              event.subframes = stream.readUint8();
+              if(strictMode && 99 < event.subframes) {
+                throw new Error(stream.pos() + ' SMTPE offset subframes value' +
+                  ' must be part of 0-99.');
+              }
+              return event;
+            case MIDIEvents.EVENT_META_KEY_SIGNATURE:
+              if(strictMode && 2 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.key = stream.readUint8();
+              if(strictMode && (-7 > event.key || 7 < event.key)) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.scale = stream.readUint8();
+              if(strictMode && 0 !== event.scale && 1 !== event.scale) {
+                throw new Error(stream.pos() + ' Key signature scale value must' +
+                  ' be 0 or 1.');
+              }
+              return event;
+            case MIDIEvents.EVENT_META_TIME_SIGNATURE:
+              if(strictMode && 4 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.data = stream.readBytes(event.length);
+              event.param1 = event.data[0];
+              event.param2 = event.data[1];
+              event.param3 = event.data[2];
+              event.param4 = event.data[3];
+              return event;
+            case MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC:
+              event.data = stream.readBytes(event.length);
+              return event;
+            default:
+              if(strictMode) {
+                throw new Error(stream.pos() + ' Unknown meta event type ' +
+                  '(' + event.subtype.toString(16) + ').');
+              }
+              event.data = stream.readBytes(event.length);
+              return event;
+          }
+        // System events
+        } 
+        else if(eventTypeByte === MIDIEvents.EVENT_SYSEX || eventTypeByte === MIDIEvents.EVENT_DIVSYSEX) {
+          event.type = eventTypeByte;
+          event.length = stream.readVarInt();
+          event.data = stream.readBytes(event.length);
+          return event;
+        // Unknown event, assuming it's system like event
+        } 
+        else {
+          if(strictMode) {
+            throw new Error(stream.pos() + ' Unknown event type ' +
+              eventTypeByte.toString(16) + ', Delta: ' + event.delta + '.');
+          }
+          event.type = eventTypeByte;
+          event.badsubtype = stream.readVarInt();
+          event.length = stream.readUint8();
+          event.data = stream.readBytes(event.length);
+          return event;
+        }
+      // MIDI eventsdestination[index++]
+      } 
+      else {
+        // running status
+        if(0 === (eventTypeByte & 0x80)) {
+          if(!(MIDIEventType)) {
+            throw new Error(stream.pos() + ' Running status without previous event');
+          }
+          MIDIEventParam1 = eventTypeByte;
+        } 
+        else {
+          MIDIEventType = eventTypeByte >> 4;
+          MIDIEventChannel = eventTypeByte & 0x0F;
+          MIDIEventParam1 = stream.readUint8();
+        }
+        event.type = MIDIEvents.EVENT_MIDI;
+        event.subtype = MIDIEventType;
+        event.channel = MIDIEventChannel;
+        event.param1 = MIDIEventParam1;
+        switch(MIDIEventType) {
+          case MIDIEvents.EVENT_MIDI_NOTE_OFF:
+            event.param2 = stream.readUint8();
+            return event;
+          case MIDIEvents.EVENT_MIDI_NOTE_ON:
+            event.param2 = stream.readUint8();
+
+            // If velocity is 0, it's a note off event in fact
+            if(!event.param2) {
+              event.subtype = MIDIEvents.EVENT_MIDI_NOTE_OFF;
+              event.param2 = 127; // Find a standard telling what to do here
+            }
+            return event;
+          case MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH:
+            event.param2 = stream.readUint8();
+            return event;
+          case MIDIEvents.EVENT_MIDI_CONTROLLER:
+            event.param2 = stream.readUint8();
+            return event;
+          case MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE:
+            return event;
+          case MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH:
+            return event;
+          case MIDIEvents.EVENT_MIDI_PITCH_BEND:
+            event.param2 = stream.readUint8();
+            return event;
+          default:
+            if(strictMode) {
+              throw new Error(stream.pos() + ' Unknown MIDI event type ' +
+                '(' + MIDIEventType.toString(16) + ').');
+            }
+            return event;
+        }
+      }
+    },
+  };
+};
+
+// Return the buffer length needed to encode the given events
+MIDIEvents.writeToTrack = function midiEventsWriteToTrack(events, destination, strictMode) {
+  var index = 0;
+  var i;
+  var j;
+  var k;
+  var l;
+
+  // Converting each event to binary MIDI datas
+  for(i = 0, j = events.length; i < j; i++) {
+    // Writing delta value
+    if(events[i].delta >>> 28) {
+      throw Error('Event #' + i + ': Maximum delta time value reached (' +
+        events[i].delta + '/134217728 max)');
+    }
+    if(events[i].delta >>> 21) {
+      destination[index++] = ((events[i].delta >>> 21) & 0x7F) | 0x80;
+    }
+    if(events[i].delta >>> 14) {
+      destination[index++] = ((events[i].delta >>> 14) & 0x7F) | 0x80;
+    }
+    if(events[i].delta >>> 7) {
+      destination[index++] = ((events[i].delta >>> 7) & 0x7F) | 0x80;
+    }
+    destination[index++] = (events[i].delta & 0x7F);
+    // MIDI Events encoding
+    if(events[i].type === MIDIEvents.EVENT_MIDI) {
+      // Adding the byte of subtype + channel
+      destination[index++] = (events[i].subtype << 4) + events[i].channel;
+      // Adding the byte of the first params
+      destination[index++] = events[i].param1;
+      // Adding a byte for the optionnal second param
+      if(-1 !== MIDIEvents.MIDI_2PARAMS_EVENTS.indexOf(events[i].subtype)) {
+        destination[index++] = events[i].param2;
+      }
+    // META / SYSEX events encoding
+    } else {
+      // Adding the event type byte
+      destination[index++] = events[i].type;
+      // Adding the META event subtype byte
+      if(events[i].type === MIDIEvents.EVENT_META) {
+        destination[index++] = events[i].subtype;
+      }
+      // Writing the event length bytes
+      if(events[i].length >>> 28) {
+        throw Error('Event #' + i + ': Maximum length reached (' +
+          events[i].length + '/134217728 max)');
+      }
+      if(events[i].length >>> 21) {
+        destination[index++] = ((events[i].length >>> 21) & 0x7F) | 0x80;
+      }
+      if(events[i].length >>> 14) {
+        destination[index++] = ((events[i].length >>> 14) & 0x7F) | 0x80;
+      }
+      if(events[i].length >>> 7) {
+        destination[index++] = ((events[i].length >>> 7) & 0x7F) | 0x80;
+      }
+      destination[index++] = (events[i].length & 0x7F);
+      if(events[i].type === MIDIEvents.EVENT_META) {
+        switch(events[i].subtype) {
+          case MIDIEvents.EVENT_META_SEQUENCE_NUMBER:
+            destination[index++] = events[i].msb;
+            destination[index++] = events[i].lsb;
+            break;
+          case MIDIEvents.EVENT_META_TEXT:
+          case MIDIEvents.EVENT_META_COPYRIGHT_NOTICE:
+          case MIDIEvents.EVENT_META_TRACK_NAME:
+          case MIDIEvents.EVENT_META_INSTRUMENT_NAME:
+          case MIDIEvents.EVENT_META_LYRICS:
+          case MIDIEvents.EVENT_META_MARKER:
+          case MIDIEvents.EVENT_META_CUE_POINT:
+            for(k = 0, l = events[i].length; k < l; k++) {
+              destination[index++] = events[i].data[k];
+            }
+            break;
+          case MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX:
+            destination[index++] = events[i].prefix;
+            break;
+          case MIDIEvents.EVENT_META_END_OF_TRACK:
+            break;
+          case MIDIEvents.EVENT_META_SET_TEMPO:
+            destination[index++] = (events[i].tempo >> 16);
+            destination[index++] = (events[i].tempo >> 8) & 0xFF;
+            destination[index++] = events[i].tempo & 0xFF;
+            break;
+          case MIDIEvents.EVENT_META_SMTPE_OFFSET:
+            if(strictMode && 23 < events[i].hour) {
+              throw new Error('Event #' + i + ': SMTPE offset hour value must be' +
+                ' part of 0-23.');
+            }
+            destination[index++] = events[i].hour;
+            if(strictMode && 59 < events[i].minutes) {
+              throw new Error('Event #' + i + ': SMTPE offset minutes value must' +
+                ' be part of 0-59.');
+            }
+            destination[index++] = events[i].minutes;
+            if(strictMode && 59 < events[i].seconds) {
+              throw new Error('Event #' + i + ': SMTPE offset seconds value must' +
+                ' be part of 0-59.');
+            }
+            destination[index++] = events[i].seconds;
+            if(strictMode && 30 < events[i].frames) {
+              throw new Error('Event #' + i + ': SMTPE offset frames amount must' +
+                ' be part of 0-30.');
+            }
+            destination[index++] = events[i].frames;
+            if(strictMode && 99 < events[i].subframes) {
+              throw new Error('Event #' + i + ': SMTPE offset subframes amount' +
+                ' must be part of 0-99.');
+            }
+            destination[index++] = events[i].subframes;
+            break;
+          case MIDIEvents.EVENT_META_KEY_SIGNATURE:
+            if('number' != typeof events[i].key || -7 > events[i].key ||
+              7 < events[i].scale) {
+              throw new Error('Event #' + i + ':The key signature key must be' +
+                ' between -7 and 7');
+            }
+            if('number' !== typeof events[i].scale ||
+              0 > events[i].scale || 1 < events[i].scale) {
+              throw new Error('Event #' + i + ':' +
+              'The key signature scale must be 0 or 1');
+            }
+            destination[index++] = events[i].key;
+            destination[index++] = events[i].scale;
+            break;
+          // Not implemented
+          case MIDIEvents.EVENT_META_TIME_SIGNATURE:
+          case MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC:
+          default:
+            for(k = 0, l = events[i].length; k < l; k++) {
+              destination[index++] = events[i].data[k];
+            }
+            break;
+        }
+      // Adding bytes corresponding to the sysex event datas
+      } else {
+        for(k = 0, l = events[i].length; k < l; k++) {
+          destination[index++] = events[i].data[k];
+        }
+      }
+    }
+  }
+};
+
+// Return the buffer length needed to encode the given events
+MIDIEvents.getRequiredBufferLength = function(events) {
+  var bufferLength = 0;
+  var i = 0;
+  var j;
+
+  // Calculating the track size by adding events lengths
+  for(i = 0, j = events.length; i < j; i++) {
+    // Computing necessary bytes to encode the delta value
+    bufferLength +=
+      events[i].delta >>> 21 ? 4 :
+        events[i].delta >>> 14 ? 3 :
+          events[i].delta >>> 7 ? 2 : 1;
+    // MIDI Events have various fixed lengths
+    if(events[i].type === MIDIEvents.EVENT_MIDI) {
+      // Adding a byte for subtype + channel
+      bufferLength++;
+      // Adding a byte for the first params
+      bufferLength++;
+      // Adding a byte for the optionnal second param
+      if(-1 !== MIDIEvents.MIDI_2PARAMS_EVENTS.indexOf(events[i].subtype)) {
+        bufferLength++;
+      }
+    // META / SYSEX events lengths are self defined
+    } else {
+      // Adding a byte for the event type
+      bufferLength++;
+      // Adding a byte for META events subtype
+      if(events[i].type === MIDIEvents.EVENT_META) {
+        bufferLength++;
+      }
+      // Adding necessary bytes to encode the length
+      bufferLength +=
+        events[i].length >>> 21 ? 4 :
+          events[i].length >>> 14 ? 3 :
+            events[i].length >>> 7 ? 2 : 1;
+      // Adding bytes corresponding to the event length
+      bufferLength += events[i].length;
+    }
+  }
+  return bufferLength;
+};
+
+module.exports = MIDIEvents;
+
+},{}],2:[function(require,module,exports){
+/*! http://mths.be/fromcodepoint v0.2.1 by @mathias */
+if (!String.fromCodePoint) {
+	(function() {
+		var defineProperty = (function() {
+			// IE 8 only supports `Object.defineProperty` on DOM elements
+			try {
+				var object = {};
+				var $defineProperty = Object.defineProperty;
+				var result = $defineProperty(object, object, object) && $defineProperty;
+			} catch(error) {}
+			return result;
+		}());
+		var stringFromCharCode = String.fromCharCode;
+		var floor = Math.floor;
+		var fromCodePoint = function(_) {
+			var MAX_SIZE = 0x4000;
+			var codeUnits = [];
+			var highSurrogate;
+			var lowSurrogate;
+			var index = -1;
+			var length = arguments.length;
+			if (!length) {
+				return '';
+			}
+			var result = '';
+			while (++index < length) {
+				var codePoint = Number(arguments[index]);
+				if (
+					!isFinite(codePoint) || // `NaN`, `+Infinity`, or `-Infinity`
+					codePoint < 0 || // not a valid Unicode code point
+					codePoint > 0x10FFFF || // not a valid Unicode code point
+					floor(codePoint) != codePoint // not an integer
+				) {
+					throw RangeError('Invalid code point: ' + codePoint);
+				}
+				if (codePoint <= 0xFFFF) { // BMP code point
+					codeUnits.push(codePoint);
+				} else { // Astral code point; split in surrogate halves
+					// http://mathiasbynens.be/notes/javascript-encoding#surrogate-formulae
+					codePoint -= 0x10000;
+					highSurrogate = (codePoint >> 10) + 0xD800;
+					lowSurrogate = (codePoint % 0x400) + 0xDC00;
+					codeUnits.push(highSurrogate, lowSurrogate);
+				}
+				if (index + 1 == length || codeUnits.length > MAX_SIZE) {
+					result += stringFromCharCode.apply(null, codeUnits);
+					codeUnits.length = 0;
+				}
+			}
+			return result;
+		};
+		if (defineProperty) {
+			defineProperty(String, 'fromCodePoint', {
+				'value': fromCodePoint,
+				'configurable': true,
+				'writable': true
+			});
+		} else {
+			String.fromCodePoint = fromCodePoint;
+		}
+	}());
+}
+
+},{}],3:[function(require,module,exports){
+/*! http://mths.be/codepointat v0.2.0 by @mathias */
+if (!String.prototype.codePointAt) {
+	(function() {
+		'use strict'; // needed to support `apply`/`call` with `undefined`/`null`
+		var defineProperty = (function() {
+			// IE 8 only supports `Object.defineProperty` on DOM elements
+			try {
+				var object = {};
+				var $defineProperty = Object.defineProperty;
+				var result = $defineProperty(object, object, object) && $defineProperty;
+			} catch(error) {}
+			return result;
+		}());
+		var codePointAt = function(position) {
+			if (this == null) {
+				throw TypeError();
+			}
+			var string = String(this);
+			var size = string.length;
+			// `ToInteger`
+			var index = position ? Number(position) : 0;
+			if (index != index) { // better `isNaN`
+				index = 0;
+			}
+			// Account for out-of-bounds indices:
+			if (index < 0 || index >= size) {
+				return undefined;
+			}
+			// Get the first code unit
+			var first = string.charCodeAt(index);
+			var second;
+			if ( // check if it’s the start of a surrogate pair
+				first >= 0xD800 && first <= 0xDBFF && // high surrogate
+				size > index + 1 // there is a next code unit
+			) {
+				second = string.charCodeAt(index + 1);
+				if (second >= 0xDC00 && second <= 0xDFFF) { // low surrogate
+					// http://mathiasbynens.be/notes/javascript-encoding#surrogate-formulae
+					return (first - 0xD800) * 0x400 + second - 0xDC00 + 0x10000;
+				}
+			}
+			return first;
+		};
+		if (defineProperty) {
+			defineProperty(String.prototype, 'codePointAt', {
+				'value': codePointAt,
+				'configurable': true,
+				'writable': true
+			});
+		} else {
+			String.prototype.codePointAt = codePointAt;
+		}
+	}());
+}
+
+},{}],4:[function(require,module,exports){
+// UTF8 : Manage UTF-8 strings in ArrayBuffers
+if(module.require) {
+  require('string.fromcodepoint');
+  require('string.prototype.codepointat');
+}
+
+var UTF8={
+  // non UTF8 encoding detection (cf README file for details)
+  'isNotUTF8': function(bytes, byteOffset, byteLength) {
+    try {
+      UTF8.getStringFromBytes(bytes, byteOffset, byteLength, true);
+    } catch(e) {
+      return true;
+    }
+    return false;
+  },
+  // UTF8 decoding functions
+  'getCharLength': function(theByte) {
+    // 4 bytes encoded char (mask 11110000)
+    if(0xF0 == (theByte&0xF0)) {
+      return 4;
+    // 3 bytes encoded char (mask 11100000)
+    } else if(0xE0 == (theByte&0xE0)) {
+      return 3;
+    // 2 bytes encoded char (mask 11000000)
+    } else if(0xC0 == (theByte&0xC0)) {
+      return 2;
+    // 1 bytes encoded char
+    } else if(theByte == (theByte&0x7F)) {
+      return 1;
+    }
+    return 0;
+  },
+  'getCharCode': function(bytes, byteOffset, charLength) {
+    var charCode = 0, mask = '';
+    byteOffset = byteOffset || 0;
+    // Retrieve charLength if not given
+    charLength = charLength || UTF8.getCharLength(bytes[byteOffset]);
+    if(charLength == 0) {
+      throw new Error(bytes[byteOffset].toString(2)+' is not a significative' +
+        ' byte (offset:'+byteOffset+').');
+    }
+    // Return byte value if charlength is 1
+    if(1 === charLength) {
+      return bytes[byteOffset];
+    }
+    // Test UTF8 integrity
+    mask = '00000000'.slice(0, charLength) + 1 + '00000000'.slice(charLength + 1);
+    if(bytes[byteOffset]&(parseInt(mask, 2))) {
+      throw Error('Index ' + byteOffset + ': A ' + charLength + ' bytes' +
+        ' encoded char' +' cannot encode the '+(charLength+1)+'th rank bit to 1.');
+    }
+    // Reading the first byte
+    mask='0000'.slice(0,charLength+1)+'11111111'.slice(charLength+1);
+    charCode+=(bytes[byteOffset]&parseInt(mask,2))<<((--charLength)*6);
+    // Reading the next bytes
+    while(charLength) {
+      if(0x80!==(bytes[byteOffset+1]&0x80)
+        ||0x40===(bytes[byteOffset+1]&0x40)) {
+        throw Error('Index '+(byteOffset+1)+': Next bytes of encoded char'
+          +' must begin with a "10" bit sequence.');
+      }
+      charCode += ((bytes[++byteOffset]&0x3F) << ((--charLength) * 6));
+    }
+    return charCode;
+  },
+  'getStringFromBytes': function(bytes, byteOffset, byteLength, strict) {
+    var charLength, chars = [];
+    byteOffset = byteOffset|0;
+    byteLength=('number' === typeof byteLength ?
+      byteLength :
+      bytes.byteLength || bytes.length
+    );
+    for(; byteOffset < byteLength; byteOffset++) {
+      charLength = UTF8.getCharLength(bytes[byteOffset]);
+      if(byteOffset + charLength > byteLength) {
+        if(strict) {
+          throw Error('Index ' + byteOffset + ': Found a ' + charLength +
+            ' bytes encoded char declaration but only ' +
+            (byteLength - byteOffset) +' bytes are available.');
+        }
+      } else {
+        chars.push(String.fromCodePoint(
+          UTF8.getCharCode(bytes, byteOffset, charLength, strict)
+        ));
+      }
+      byteOffset += charLength - 1;
+    }
+    return chars.join('');
+  },
+  // UTF8 encoding functions
+  'getBytesForCharCode': function(charCode) {
+    if(charCode < 128) {
+      return 1;
+    } else if(charCode < 2048) {
+      return 2;
+    } else if(charCode < 65536) {
+      return 3;
+    } else if(charCode < 2097152) {
+      return 4;
+    }
+    throw new Error('CharCode '+charCode+' cannot be encoded with UTF8.');
+  },
+  'setBytesFromCharCode': function(charCode, bytes, byteOffset, neededBytes) {
+    charCode = charCode|0;
+    bytes = bytes || [];
+    byteOffset = byteOffset|0;
+    neededBytes = neededBytes || UTF8.getBytesForCharCode(charCode);
+    // Setting the charCode as it to bytes if the byte length is 1
+    if(1 == neededBytes) {
+      bytes[byteOffset] = charCode;
+    } else {
+      // Computing the first byte
+      bytes[byteOffset++] =
+        (parseInt('1111'.slice(0, neededBytes), 2) << 8 - neededBytes) +
+        (charCode >>> ((--neededBytes) * 6));
+      // Computing next bytes
+      for(;neededBytes>0;) {
+        bytes[byteOffset++] = ((charCode>>>((--neededBytes) * 6))&0x3F)|0x80;
+      }
+    }
+    return bytes;
+  },
+  'setBytesFromString': function(string, bytes, byteOffset, byteLength, strict) {
+    string = string || '';
+    bytes = bytes || [];
+    byteOffset = byteOffset|0;
+    byteLength = ('number' === typeof byteLength ?
+      byteLength :
+      bytes.byteLength||Infinity
+    );
+    for(var i = 0, j = string.length; i < j; i++) {
+      var neededBytes = UTF8.getBytesForCharCode(string[i].codePointAt(0));
+      if(strict && byteOffset + neededBytes > byteLength) {
+        throw new Error('Not enought bytes to encode the char "' + string[i] +
+          '" at the offset "' + byteOffset + '".');
+      }
+      UTF8.setBytesFromCharCode(string[i].codePointAt(0),
+        bytes, byteOffset, neededBytes, strict);
+      byteOffset += neededBytes;
+    }
+    return bytes;
+  }
+};
+
+if('undefined' !== typeof module) {
+  module.exports = UTF8;
+}
+
+
+},{"string.fromcodepoint":2,"string.prototype.codepointat":3}],5:[function(require,module,exports){
+'use strict';
+
+// MIDIFile : Read (and soon edit) a MIDI file in a given ArrayBuffer
+
+// Dependencies
+var MIDIFileHeader = require('./MIDIFileHeader');
+var MIDIFileTrack = require('./MIDIFileTrack');
+var MIDIEvents = require('midievents');
+var UTF8 = require('utf-8');
+
+// Constructor
+function MIDIFile(buffer, strictMode) {
+  var track;
+  var curIndex;
+  var i;
+  var j;
+
+  // If not buffer given, creating a new MIDI file
+  if(!buffer) {
+    // Creating the content
+    this.header = new MIDIFileHeader();
+    this.tracks = [new MIDIFileTrack()];
+  // if a buffer is provided, parsing him
+  } else {
+    if(!(buffer instanceof ArrayBuffer)) {
+      throw new Error('Invalid buffer received.');
+    }
+    // Minimum MIDI file size is a headerChunk size (14bytes)
+    // and an empty track (8+3bytes)
+    if(25 > buffer.byteLength) {
+      throw new Error('A buffer of a valid MIDI file must have, at least, a' +
+        ' size of 25bytes.');
+    }
+    // Reading header
+    this.header = new MIDIFileHeader(buffer, strictMode);
+    this.tracks = [];
+    curIndex = MIDIFileHeader.HEADER_LENGTH;
+    // Reading tracks
+    for(i = 0, j = this.header.getTracksCount(); i < j; i++) {
+      // Testing the buffer length
+      if(strictMode && curIndex >= buffer.byteLength - 1) {
+        throw new Error('Couldn\'t find datas corresponding to the track #' + i + '.');
+      }
+      // Creating the track object
+      track = new MIDIFileTrack(buffer, curIndex, strictMode);
+      this.tracks.push(track);
+      // Updating index to the track end
+      curIndex += track.getTrackLength() + 8;
+    }
+    // Testing integrity : curIndex should be at the end of the buffer
+    if(strictMode && curIndex !== buffer.byteLength) {
+      throw new Error('It seems that the buffer contains too much datas.');
+    }
+  }
+}
+
+// Events reading helpers
+MIDIFile.prototype.getEvents = function(type, subtype) {
+  var events;
+  var event;
+  var playTime = 0;
+  var filteredEvents = [];
+  var format = this.header.getFormat();
+  var tickResolution = this.header.getTickResolution();
+  var i;
+  var j;
+  var trackParsers;
+  var smallestDelta;
+
+  // Reading events
+  // if the read is sequential
+  if(1 !== format || 1 === this.tracks.length) {
+    for(i = 0, j = this.tracks.length; i < j; i++) {
+      // reset playtime if format is 2
+      playTime = (2 === format && playTime ? playTime : 0);
+      events = MIDIEvents.createParser(this.tracks[i].getTrackContent(), 0, false);
+      // loooping through events
+      event = events.next();
+      while(event) {
+        playTime += event.delta ? (event.delta * tickResolution) / 1000 : 0;
+        if(event.type === MIDIEvents.EVENT_META) {
+          // tempo change events
+          if(event.subtype === MIDIEvents.EVENT_META_SET_TEMPO) {
+            tickResolution = this.header.getTickResolution(event.tempo);
+          }
+        }
+        // push the asked events
+        if(((!type) || event.type === type) &&
+          ((!subtype) || (event.subtype && event.subtype === type))) {
+          event.playTime = playTime;
+          filteredEvents.push(event);
+        }
+        event = events.next();
+      }
+    }
+  // the read is concurrent
+  } else {
+    trackParsers = [];
+    smallestDelta = -1;
+
+    // Creating parsers
+    for(i = 0, j = this.tracks.length; i < j; i++) {
+      trackParsers[i] = {};
+      trackParsers[i].parser = MIDIEvents.createParser(
+          this.tracks[i].getTrackContent(), 0, false);
+      trackParsers[i].curEvent = trackParsers[i].parser.next();
+    }
+    // Filling events
+    do {
+      smallestDelta = -1;
+      // finding the smallest event
+      for(i = 0, j = trackParsers.length; i < j; i++) {
+        if(trackParsers[i].curEvent) {
+          if(-1 === smallestDelta || trackParsers[i].curEvent.delta <
+            trackParsers[smallestDelta].curEvent.delta) {
+            smallestDelta = i;
+          }
+        }
+      }
+      if(-1 !== smallestDelta) {
+        // removing the delta of previous events
+        for(i = 0, j = trackParsers.length; i < j; i++) {
+          if(i !== smallestDelta && trackParsers[i].curEvent) {
+            trackParsers[i].curEvent.delta -= trackParsers[smallestDelta].curEvent.delta;
+          }
+        }
+        // filling values
+        event = trackParsers[smallestDelta].curEvent;
+        playTime += (event.delta ? (event.delta * tickResolution) / 1000 : 0);
+        if(event.type === MIDIEvents.EVENT_META) {
+          // tempo change events
+          if(event.subtype === MIDIEvents.EVENT_META_SET_TEMPO) {
+            tickResolution = this.header.getTickResolution(event.tempo);
+          }
+        }
+        // push midi events
+        if(((!type) || event.type === type) &&
+          ((!subtype) || (event.subtype && event.subtype === type))) {
+          event.playTime = playTime;
+          event.track = smallestDelta;
+          filteredEvents.push(event);
+        }
+        // getting next event
+        trackParsers[smallestDelta].curEvent = trackParsers[smallestDelta].parser.next();
+      }
+    } while(-1 !== smallestDelta);
+  }
+  return filteredEvents;
+};
+
+MIDIFile.prototype.getMidiEvents = function() {
+  return this.getEvents(MIDIEvents.EVENT_MIDI);
+};
+
+MIDIFile.prototype.getLyrics = function() {
+  var events = this.getEvents(MIDIEvents.EVENT_META);
+  var texts = [];
+  var lyrics = [];
+  var event;
+  var i;
+  var j;
+
+  for(i = 0, j = events.length; i < j; i++) {
+    event = events[i];
+    // Lyrics
+    if(event.subtype === MIDIEvents.EVENT_META_LYRICS) {
+      lyrics.push(event);
+    // Texts
+    } else if(event.subtype === MIDIEvents.EVENT_META_TEXT) {
+      // Ignore special texts
+      if('@' === String.fromCharCode(event.data[0])) {
+        if('T' === String.fromCharCode(event.data[1])) {
+          // console.log('Title : ' + event.text.substring(2));
+        } else if('I' === String.fromCharCode(event.data[1])) {
+          // console.log('Info : ' + event.text.substring(2));
+        } else if('L' === String.fromCharCode(event.data[1])) {
+          // console.log('Lang : ' + event.text.substring(2));
+        }
+      // karaoke text follows, remove all previous text
+      } else if(0 === String.fromCharCode.apply(String, event.data).indexOf('words')) {
+        texts.length = 0;
+        // console.log('Word marker found');
+      // Karaoke texts
+      // If playtime is greater than 0
+      } else if(0 !== event.playTime) {
+        texts.push(event);
+      }
+    }
+  }
+  // Choosing the right lyrics
+  if(2 < lyrics.length) {
+    texts = lyrics;
+  } else if(!texts.length) {
+    texts = [];
+  }
+  // Convert texts and detect encoding
+  try {
+    texts.forEach(function(event) {
+      event.text = UTF8.getStringFromBytes(event.data, 0, event.length, true);
+    });
+  } catch (e) {
+    texts.forEach(function(event) {
+      event.text = event.data.map(function(c) {
+        return String.fromCharCode(c);
+      }).join('');
+    });
+  }
+  return texts;
+};
+
+// Basic events reading
+MIDIFile.prototype.getTrackEvents = function(index) {
+  var event;
+  var events = [];
+  var parser;
+  if(index > this.tracks.length || 0 > index) {
+    throw Error('Invalid track index (' + index + ')');
+  }
+  parser = MIDIEvents.createParser(
+    this.tracks[index].getTrackContent(), 0, false
+  );
+  event = parser.next();
+  do {
+    events.push(event);
+    event = parser.next();
+  } while(event);
+  return events;
+};
+
+// Basic events writting
+MIDIFile.prototype.setTrackEvents = function(index, events) {
+  var bufferLength;
+  var destination;
+
+  if(index > this.tracks.length || 0 > index) {
+    throw Error('Invalid track index (' + index + ')');
+  }
+  if((!events) || (!events.length)) {
+    throw Error('A track must contain at least one event, none given.');
+  }
+  bufferLength = MIDIEvents.getRequiredBufferLength(events);
+  destination = new Uint8Array(bufferLength);
+  MIDIEvents.writeToTrack(events, destination);
+  this.tracks[index].setTrackContent(destination);
+};
+
+// Remove a track
+MIDIFile.prototype.deleteTrack = function(index) {
+  if(index > this.tracks.length || 0 > index) {
+    throw Error('Invalid track index (' + index + ')');
+  }
+  this.tracks.splice(index, 1);
+  this.header.setTracksCount(this.tracks.length);
+};
+
+// Add a track
+MIDIFile.prototype.addTrack = function(index) {
+  var track;
+
+  if(index > this.tracks.length || 0 > index) {
+    throw Error('Invalid track index (' + index + ')');
+  }
+  track = new MIDIFileTrack();
+  if(index === this.tracks.length) {
+    this.tracks.push(track);
+  } else {
+    this.tracks.splice(index, 0, track);
+  }
+  this.header.setTracksCount(this.tracks.length);
+};
+
+// Retrieve the content in a buffer
+MIDIFile.prototype.getContent = function() {
+  var bufferLength;
+  var destination;
+  var origin;
+  var i;
+  var j;
+  var k;
+  var l;
+  var m;
+  var n;
+
+  // Calculating the buffer content
+  // - initialize with the header length
+  bufferLength = MIDIFileHeader.HEADER_LENGTH;
+  // - add tracks length
+  for(i = 0, j = this.tracks.length; i < j; i++) {
+    bufferLength += this.tracks[i].getTrackLength() + 8;
+  }
+  // Creating the destination buffer
+  destination = new Uint8Array(bufferLength);
+  // Adding header
+  origin = new Uint8Array(this.header.datas.buffer,
+    this.header.datas.byteOffset,
+    MIDIFileHeader.HEADER_LENGTH);
+  for(i = 0, j = MIDIFileHeader.HEADER_LENGTH; i < j; i++) {
+    destination[i] = origin[i];
+  }
+  // Adding tracks
+  for(k = 0, l = this.tracks.length; k < l; k++) {
+    origin = new Uint8Array(this.tracks[k].datas.buffer,
+      this.tracks[k].datas.byteOffset,
+      this.tracks[k].datas.byteLength);
+    for(m = 0, n = this.tracks[k].datas.byteLength; m < n; m++) {
+      destination[i++] = origin[m];
+    }
+  }
+  return destination.buffer;
+};
+
+// Exports Track/Header constructors
+MIDIFile.Header = MIDIFileHeader;
+MIDIFile.Track = MIDIFileTrack;
+
+module.exports = MIDIFile;
+
+},{"./MIDIFileHeader":6,"./MIDIFileTrack":7,"midievents":1,"utf-8":4}],6:[function(require,module,exports){
+'use strict';
+
+// MIDIFileHeader : Read and edit a MIDI header chunk in a given ArrayBuffer
+function MIDIFileHeader(buffer) {
+  var a;
+  // No buffer creating him
+  if(!buffer) {
+    a = new Uint8Array(MIDIFileHeader.HEADER_LENGTH);
+    // Adding the header id (MThd)
+    a[0] = 0x4D; a[1] = 0x54; a[2] = 0x68; a[3] = 0x64;
+    // Adding the header chunk size
+    a[4] = 0x00; a[5] = 0x00; a[6] = 0x00; a[7] = 0x06;
+    // Adding the file format (1 here cause it's the most commonly used)
+    a[8] = 0x00; a[9] = 0x01;
+    // Adding the track count (1 cause it's a new file)
+    a[10] = 0x00; a[11] = 0x01;
+    // Adding the time division (192 ticks per beat)
+    a[12] = 0x00; a[13] = 0xC0;
+    // saving the buffer
+    this.datas = new DataView(a.buffer, 0, MIDIFileHeader.HEADER_LENGTH);
+  // Parsing the given buffer
+  } else {
+    if(!(buffer instanceof ArrayBuffer)) {
+      throw Error('Invalid buffer received.');
+    }
+    this.datas = new DataView(buffer, 0, MIDIFileHeader.HEADER_LENGTH);
+    // Reading MIDI header chunk
+    if(!(
+      'M' === String.fromCharCode(this.datas.getUint8(0)) &&
+      'T' === String.fromCharCode(this.datas.getUint8(1)) &&
+      'h' === String.fromCharCode(this.datas.getUint8(2)) &&
+      'd' === String.fromCharCode(this.datas.getUint8(3))
+    )) {
+      throw new Error('Invalid MIDIFileHeader : MThd prefix not found');
+    }
+    // Reading chunk length
+    if(6 !== this.datas.getUint32(4)) {
+      throw new Error('Invalid MIDIFileHeader : Chunk length must be 6');
+    }
+  }
+}
+
+// Static constants
+MIDIFileHeader.HEADER_LENGTH = 14;
+MIDIFileHeader.FRAMES_PER_SECONDS = 1;
+MIDIFileHeader.TICKS_PER_BEAT = 2;
+
+// MIDI file format
+MIDIFileHeader.prototype.getFormat = function() {
+  var format = this.datas.getUint16(8);
+  if(0 !== format && 1 !== format && 2 !== format) {
+    throw new Error('Invalid MIDI file : MIDI format (' + format + '),' +
+      ' format can be 0, 1 or 2 only.');
+  }
+  return format;
+};
+
+MIDIFileHeader.prototype.setFormat = function(format) {
+  if(0 !== format && 1 !== format && 2 !== format) {
+    throw new Error('Invalid MIDI format given (' + format + '),' +
+      ' format can be 0, 1 or 2 only.');
+  }
+  this.datas.setUint16(8, format);
+};
+
+// Number of tracks
+MIDIFileHeader.prototype.getTracksCount = function() {
+  return this.datas.getUint16(10);
+};
+
+MIDIFileHeader.prototype.setTracksCount = function(n) {
+  return this.datas.setUint16(10, n);
+};
+
+// Tick compute
+MIDIFileHeader.prototype.getTickResolution = function(tempo) {
+  // Frames per seconds
+  if(this.datas.getUint16(12) & 0x8000) {
+    return 1000000 / (this.getSMPTEFrames() * this.getTicksPerFrame());
+  // Ticks per beat
+  }
+  // Default MIDI tempo is 120bpm, 500ms per beat
+  tempo = tempo || 500000;
+  return tempo / this.getTicksPerBeat();
+};
+
+// Time division type
+MIDIFileHeader.prototype.getTimeDivision = function() {
+  if(this.datas.getUint16(12) & 0x8000) {
+    return MIDIFileHeader.FRAMES_PER_SECONDS;
+  }
+  return MIDIFileHeader.TICKS_PER_BEAT;
+};
+
+// Ticks per beat
+MIDIFileHeader.prototype.getTicksPerBeat = function() {
+  var divisionWord = this.datas.getUint16(12);
+  if(divisionWord & 0x8000) {
+    throw new Error('Time division is not expressed as ticks per beat.');
+  }
+  return divisionWord;
+};
+
+MIDIFileHeader.prototype.setTicksPerBeat = function(ticksPerBeat) {
+  this.datas.setUint16(12, ticksPerBeat & 0x7FFF);
+};
+
+// Frames per seconds
+MIDIFileHeader.prototype.getSMPTEFrames = function() {
+  var divisionWord = this.datas.getUint16(12);
+  var smpteFrames;
+
+  if(!(divisionWord & 0x8000)) {
+    throw new Error('Time division is not expressed as frames per seconds.');
+  }
+  smpteFrames = divisionWord & 0x7F00;
+  if(-1 === [24, 25, 29, 30].indexOf(smpteFrames)) {
+    throw new Error('Invalid SMPTE frames value (' + smpteFrames + ').');
+  }
+  return 29 === smpteFrames ? 29.97 : smpteFrames;
+};
+
+MIDIFileHeader.prototype.getTicksPerFrame = function() {
+  var divisionWord = this.datas.getUint16(12);
+
+  if(!(divisionWord & 0x8000)) {
+    throw new Error('Time division is not expressed as frames per seconds.');
+  }
+  return divisionWord & 0x00FF;
+};
+
+MIDIFileHeader.prototype.setSMTPEDivision = function(smpteFrames, ticksPerFrame) {
+  if(29.97 === smpteFrames) {
+    smpteFrames = 29;
+  }
+  if(-1 === [24, 25, 29, 30].indexOf(smpteFrames)) {
+    throw new Error('Invalid SMPTE frames value given (' + smpteFrames + ').');
+  }
+  if(0 > ticksPerFrame || 0xFF < ticksPerFrame) {
+    throw new Error('Invalid ticks per frame value given (' + smpteFrames + ').');
+  }
+  this.datas.setUint8(12, 0x80 | smpteFrames);
+  this.datas.setUint8(13, ticksPerFrame);
+};
+
+module.exports = MIDIFileHeader;
+
+},{}],7:[function(require,module,exports){
+'use strict';
+
+// MIDIFileTrack : Read and edit a MIDI track chunk in a given ArrayBuffer
+function MIDIFileTrack(buffer, start) {
+  var a;
+  var trackLength;
+
+  // no buffer, creating him
+  if(!buffer) {
+    a = new Uint8Array(12);
+    // Adding the empty track header (MTrk)
+    a[0] = 0x4D; a[1] = 0x54; a[2] = 0x72; a[3] = 0x6B;
+    // Adding the empty track size (4)
+    a[4] = 0x00; a[5] = 0x00; a[6] = 0x00; a[7] = 0x04;
+    // Adding the track end event
+    a[8] = 0x00; a[9] = 0xFF; a[10] = 0x2F; a[11] = 0x00;
+    // Saving the buffer
+    this.datas = new DataView(a.buffer, 0, MIDIFileTrack.HDR_LENGTH + 4);
+  // parsing the given buffer
+  } else {
+    if(!(buffer instanceof ArrayBuffer)) {
+      throw new Error('Invalid buffer received.');
+    }
+    // Buffer length must size at least like an  empty track (8+3bytes)
+    if(12 > buffer.byteLength - start) {
+      throw new Error('Invalid MIDIFileTrack (0x' + start.toString(16) + ') :' +
+        ' Buffer length must size at least 12bytes');
+    }
+    // Creating a temporary view to read the track header
+    this.datas = new DataView(buffer, start, MIDIFileTrack.HDR_LENGTH);
+    // Reading MIDI track header chunk
+    if(!(
+      'M' === String.fromCharCode(this.datas.getUint8(0)) &&
+      'T' === String.fromCharCode(this.datas.getUint8(1)) &&
+      'r' === String.fromCharCode(this.datas.getUint8(2)) &&
+      'k' === String.fromCharCode(this.datas.getUint8(3))
+    )) {
+      throw new Error('Invalid MIDIFileTrack (0x' + start.toString(16) + ') :' +
+        ' MTrk prefix not found');
+    }
+    // Reading the track length
+    trackLength = this.getTrackLength();
+    if(buffer.byteLength - start < trackLength) {
+      throw new Error('Invalid MIDIFileTrack (0x' + start.toString(16) + ') :' +
+        ' The track size exceed the buffer length.');
+    }
+    // Creating the final DataView
+    this.datas = new DataView(buffer, start, MIDIFileTrack.HDR_LENGTH + trackLength);
+    // Trying to find the end of track event
+    if(!(
+      0xFF === this.datas.getUint8(MIDIFileTrack.HDR_LENGTH + trackLength - 3) &&
+      0x2F === this.datas.getUint8(MIDIFileTrack.HDR_LENGTH + trackLength - 2) &&
+      0x00 === this.datas.getUint8(MIDIFileTrack.HDR_LENGTH + trackLength - 1)
+    )) {
+      throw new Error('Invalid MIDIFileTrack (0x' + start.toString(16) + ') :' +
+        ' No track end event found at the expected index' +
+        ' (' + (MIDIFileTrack.HDR_LENGTH + trackLength - 1).toString(16) + ').');
+    }
+  }
+}
+
+// Static constants
+MIDIFileTrack.HDR_LENGTH = 8;
+
+// Track length
+MIDIFileTrack.prototype.getTrackLength = function() {
+  return this.datas.getUint32(4);
+};
+
+MIDIFileTrack.prototype.setTrackLength = function(trackLength) {
+  return this.datas.setUint32(4, trackLength);
+};
+
+// Read track contents
+MIDIFileTrack.prototype.getTrackContent = function() {
+  return new DataView(this.datas.buffer,
+    this.datas.byteOffset + MIDIFileTrack.HDR_LENGTH,
+    this.datas.byteLength - MIDIFileTrack.HDR_LENGTH);
+};
+
+// Set track content
+MIDIFileTrack.prototype.setTrackContent = function(dataView) {
+  var origin;
+  var destination;
+  var i;
+  var j;
+  // Calculating the track length
+  var trackLength = dataView.byteLength - dataView.byteOffset;
+  // Track length must size at least like an  empty track (4bytes)
+  if(4 > trackLength) {
+    throw new Error('Invalid track length, must size at least 4bytes');
+  }
+  this.datas = new DataView(
+    new Uint8Array(MIDIFileTrack.HDR_LENGTH + trackLength).buffer);
+  // Adding the track header (MTrk)
+  this.datas.setUint8(0, 0x4D); // M
+  this.datas.setUint8(1, 0x54); // T
+  this.datas.setUint8(2, 0x72); // r
+  this.datas.setUint8(3, 0x6B); // k
+  // Adding the track size
+  this.datas.setUint32(4, trackLength);
+  // Copying the content
+  origin = new Uint8Array(dataView.buffer, dataView.byteOffset,
+    dataView.byteLength);
+  destination = new Uint8Array(this.datas.buffer,
+      MIDIFileTrack.HDR_LENGTH,
+      trackLength);
+  for(i = 0, j = origin.length; i < j; i++) {
+    destination[i] = origin[i];
+  }
+};
+
+module.exports = MIDIFileTrack;
+
+},{}]},{},[5])(5)
+});
+ </script>
+ <!-- MIDIPlayer -->
+ <script id="../dist/MIDIPlayer.js" type="text/javascript">
+ (function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.MIDIPlayer = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+'use strict';
+
+// MIDIEvents : Read and edit events from various sources (ArrayBuffer, Stream)
+function MIDIEvents() {
+  throw new Error('MIDIEvents function not intended to be run.');
+}
+
+// Static constants
+// Event types
+MIDIEvents.EVENT_META = 0xFF;
+MIDIEvents.EVENT_SYSEX = 0xF0;
+MIDIEvents.EVENT_DIVSYSEX = 0xF7;
+MIDIEvents.EVENT_MIDI = 0x8;
+// Meta event types
+MIDIEvents.EVENT_META_SEQUENCE_NUMBER = 0x00;
+MIDIEvents.EVENT_META_TEXT = 0x01;
+MIDIEvents.EVENT_META_COPYRIGHT_NOTICE = 0x02;
+MIDIEvents.EVENT_META_TRACK_NAME = 0x03;
+MIDIEvents.EVENT_META_INSTRUMENT_NAME = 0x04;
+MIDIEvents.EVENT_META_LYRICS = 0x05;
+MIDIEvents.EVENT_META_MARKER = 0x06;
+MIDIEvents.EVENT_META_CUE_POINT = 0x07;
+MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX = 0x20;
+MIDIEvents.EVENT_META_END_OF_TRACK = 0x2F;
+MIDIEvents.EVENT_META_SET_TEMPO = 0x51;
+MIDIEvents.EVENT_META_SMTPE_OFFSET = 0x54;
+MIDIEvents.EVENT_META_TIME_SIGNATURE = 0x58;
+MIDIEvents.EVENT_META_KEY_SIGNATURE = 0x59;
+MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC = 0x7F;
+// MIDI event types
+MIDIEvents.EVENT_MIDI_NOTE_OFF = 0x8;
+MIDIEvents.EVENT_MIDI_NOTE_ON = 0x9;
+MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH = 0xA;
+MIDIEvents.EVENT_MIDI_CONTROLLER = 0xB;
+MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE = 0xC;
+MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH = 0xD;
+MIDIEvents.EVENT_MIDI_PITCH_BEND = 0xE;
+// MIDI event sizes
+MIDIEvents.MIDI_1PARAM_EVENTS = [
+  MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE,
+  MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH,
+];
+MIDIEvents.MIDI_2PARAMS_EVENTS = [
+  MIDIEvents.EVENT_MIDI_NOTE_OFF,
+  MIDIEvents.EVENT_MIDI_NOTE_ON,
+  MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH,
+  MIDIEvents.EVENT_MIDI_CONTROLLER,
+  MIDIEvents.EVENT_MIDI_PITCH_BEND,
+];
+
+// Create an event stream parser
+MIDIEvents.createParser = function midiEventsCreateParser(stream, startAt, strictMode) {
+  // Private vars
+  // Common vars
+  var eventTypeByte;
+  var event;
+  // MIDI events vars
+  var MIDIEventType;
+  var MIDIEventChannel;
+  var MIDIEventParam1;
+
+  // Wrap DataView into a data stream
+  if(stream instanceof DataView) {
+    stream = {
+      position: startAt || 0,
+      buffer: stream,
+      readUint8: function() {
+        return this.buffer.getUint8(this.position++);
+      },
+      readUint16: function() {
+        var v = this.buffer.getUint16(this.position);
+        this.position = this.position + 2;
+        return v;
+      },
+      readUint32: function() {
+        var v = this.buffer.getUint16(this.position);
+        this.position = this.position + 2;
+        return v;
+      },
+      readVarInt: function() {
+        var v = 0;
+        var i = 0;
+        var b;
+
+        while(4 > i++) {
+          b = this.readUint8();
+
+          if (b & 0x80) {
+            v += (b & 0x7f);
+            v <<= 7;
+          } else {
+            return v + b;
+          }
+        }
+        throw new Error('0x' + this.position.toString(16) + ':' +
+          ' Variable integer length cannot exceed 4 bytes');
+      },
+      readBytes: function(length) {
+        var bytes = [];
+
+        for(; 0 < length; length--) {
+          bytes.push(this.readUint8());
+        }
+        return bytes;
+      },
+      pos: function() {
+        return '0x' + (this.buffer.byteOffset + this.position).toString(16);
+      },
+      end: function() {
+        return this.position === this.buffer.byteLength;
+      },
+    };
+    startAt = 0;
+  }
+  // Consume stream till not at start index
+  if(0 < startAt) {
+    while(startAt--) {
+      stream.readUint8();
+    }
+  }
+  // creating the parser object
+  return {
+    // Read the next event
+    next: function() {
+      // Check available datas
+      if(stream.end()) {
+        return null;
+      }
+      // Creating the event
+      event = {
+        // Memoize the event index
+        index: stream.pos(),
+        // Read the delta time
+        delta: stream.readVarInt(),
+      };
+      // Read the eventTypeByte
+      eventTypeByte = stream.readUint8();
+      if(0xF0 === (eventTypeByte & 0xF0)) {
+        // Meta events
+        if(eventTypeByte === MIDIEvents.EVENT_META) {
+          event.type = MIDIEvents.EVENT_META;
+          event.subtype = stream.readUint8();
+          event.length = stream.readVarInt();
+          switch(event.subtype) {
+            case MIDIEvents.EVENT_META_SEQUENCE_NUMBER:
+              if(strictMode && 2 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.msb = stream.readUint8();
+              event.lsb = stream.readUint8();
+              return event;
+            case MIDIEvents.EVENT_META_TEXT:
+            case MIDIEvents.EVENT_META_COPYRIGHT_NOTICE:
+            case MIDIEvents.EVENT_META_TRACK_NAME:
+            case MIDIEvents.EVENT_META_INSTRUMENT_NAME:
+            case MIDIEvents.EVENT_META_LYRICS:
+            case MIDIEvents.EVENT_META_MARKER:
+            case MIDIEvents.EVENT_META_CUE_POINT:
+              event.data = stream.readBytes(event.length);
+              return event;
+            case MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX:
+              if(strictMode && 1 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.prefix = stream.readUint8();
+              return event;
+            case MIDIEvents.EVENT_META_END_OF_TRACK:
+              if(strictMode && 0 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              return event;
+            case MIDIEvents.EVENT_META_SET_TEMPO:
+              if(strictMode && 3 !== event.length) {
+                throw new Error(stream.pos() + ' Tempo meta event length must be 3.');
+              }
+              event.tempo = (
+                (stream.readUint8() << 16) +
+                (stream.readUint8() << 8) +
+                stream.readUint8()
+              );
+              event.tempoBPM = 60000000 / event.tempo;
+              return event;
+            case MIDIEvents.EVENT_META_SMTPE_OFFSET:
+              if(strictMode && 5 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.hour = stream.readUint8();
+              if(strictMode && 23 < event.hour) {
+                throw new Error(stream.pos() + ' SMTPE offset hour value must' +
+                  ' be part of 0-23.');
+              }
+              event.minutes = stream.readUint8();
+              if(strictMode && 59 < event.minutes) {
+                throw new Error(stream.pos() + ' SMTPE offset minutes value' +
+                  ' must be part of 0-59.');
+              }
+              event.seconds = stream.readUint8();
+              if(strictMode && 59 < event.seconds) {
+                throw new Error(stream.pos() + ' SMTPE offset seconds value' +
+                  ' must be part of 0-59.');
+              }
+              event.frames = stream.readUint8();
+              if(strictMode && 30 < event.frames) {
+                throw new Error(stream.pos() + ' SMTPE offset frames value must' +
+                  ' be part of 0-30.');
+              }
+              event.subframes = stream.readUint8();
+              if(strictMode && 99 < event.subframes) {
+                throw new Error(stream.pos() + ' SMTPE offset subframes value' +
+                  ' must be part of 0-99.');
+              }
+              return event;
+            case MIDIEvents.EVENT_META_KEY_SIGNATURE:
+              if(strictMode && 2 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.key = stream.readUint8();
+              if(strictMode && (-7 > event.key || 7 < event.key)) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.scale = stream.readUint8();
+              if(strictMode && 0 !== event.scale && 1 !== event.scale) {
+                throw new Error(stream.pos() + ' Key signature scale value must' +
+                  ' be 0 or 1.');
+              }
+              return event;
+            case MIDIEvents.EVENT_META_TIME_SIGNATURE:
+              if(strictMode && 4 !== event.length) {
+                throw new Error(stream.pos() + ' Bad metaevent length.');
+              }
+              event.data = stream.readBytes(event.length);
+              event.param1 = event.data[0];
+              event.param2 = event.data[1];
+              event.param3 = event.data[2];
+              event.param4 = event.data[3];
+              return event;
+            case MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC:
+              event.data = stream.readBytes(event.length);
+              return event;
+            default:
+              if(strictMode) {
+                throw new Error(stream.pos() + ' Unknown meta event type ' +
+                  '(' + event.subtype.toString(16) + ').');
+              }
+              event.data = stream.readBytes(event.length);
+              return event;
+          }
+        // System events
+        } else if(eventTypeByte === MIDIEvents.EVENT_SYSEX ||
+            eventTypeByte === MIDIEvents.EVENT_DIVSYSEX) {
+          event.type = eventTypeByte;
+          event.length = stream.readVarInt();
+          event.data = stream.readBytes(event.length);
+          return event;
+        // Unknown event, assuming it's system like event
+        } else {
+          if(strictMode) {
+            throw new Error(stream.pos() + ' Unknown event type ' +
+              eventTypeByte.toString(16) + ', Delta: ' + event.delta + '.');
+          }
+          event.type = eventTypeByte;
+          event.badsubtype = stream.readVarInt();
+          event.length = stream.readUint8();
+          event.data = stream.readBytes(event.length);
+          return event;
+        }
+      // MIDI eventsdestination[index++]
+      } else {
+        // running status
+        if(0 === (eventTypeByte & 0x80)) {
+          if(!(MIDIEventType)) {
+            throw new Error(stream.pos() + ' Running status without previous event');
+          }
+          MIDIEventParam1 = eventTypeByte;
+        } else {
+          MIDIEventType = eventTypeByte >> 4;
+          MIDIEventChannel = eventTypeByte & 0x0F;
+          MIDIEventParam1 = stream.readUint8();
+        }
+        event.type = MIDIEvents.EVENT_MIDI;
+        event.subtype = MIDIEventType;
+        event.channel = MIDIEventChannel;
+        event.param1 = MIDIEventParam1;
+        switch(MIDIEventType) {
+          case MIDIEvents.EVENT_MIDI_NOTE_OFF:
+            event.param2 = stream.readUint8();
+            return event;
+          case MIDIEvents.EVENT_MIDI_NOTE_ON:
+            event.param2 = stream.readUint8();
+
+            // If velocity is 0, it's a note off event in fact
+            if(!event.param2) {
+              event.subtype = MIDIEvents.EVENT_MIDI_NOTE_OFF;
+              event.param2 = 127; // Find a standard telling what to do here
+            }
+            return event;
+          case MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH:
+            event.param2 = stream.readUint8();
+            return event;
+          case MIDIEvents.EVENT_MIDI_CONTROLLER:
+            event.param2 = stream.readUint8();
+            return event;
+          case MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE:
+            return event;
+          case MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH:
+            return event;
+          case MIDIEvents.EVENT_MIDI_PITCH_BEND:
+            event.param2 = stream.readUint8();
+            return event;
+          default:
+            if(strictMode) {
+              throw new Error(stream.pos() + ' Unknown MIDI event type ' +
+                '(' + MIDIEventType.toString(16) + ').');
+            }
+            return event;
+        }
+      }
+    },
+  };
+};
+
+// Return the buffer length needed to encode the given events
+MIDIEvents.writeToTrack = function midiEventsWriteToTrack(events, destination, strictMode) {
+  var index = 0;
+  var i;
+  var j;
+  var k;
+  var l;
+
+  // Converting each event to binary MIDI datas
+  for(i = 0, j = events.length; i < j; i++) {
+    // Writing delta value
+    if(events[i].delta >>> 28) {
+      throw Error('Event #' + i + ': Maximum delta time value reached (' +
+        events[i].delta + '/134217728 max)');
+    }
+    if(events[i].delta >>> 21) {
+      destination[index++] = ((events[i].delta >>> 21) & 0x7F) | 0x80;
+    }
+    if(events[i].delta >>> 14) {
+      destination[index++] = ((events[i].delta >>> 14) & 0x7F) | 0x80;
+    }
+    if(events[i].delta >>> 7) {
+      destination[index++] = ((events[i].delta >>> 7) & 0x7F) | 0x80;
+    }
+    destination[index++] = (events[i].delta & 0x7F);
+    // MIDI Events encoding
+    if(events[i].type === MIDIEvents.EVENT_MIDI) {
+      // Adding the byte of subtype + channel
+      destination[index++] = (events[i].subtype << 4) + events[i].channel;
+      // Adding the byte of the first params
+      destination[index++] = events[i].param1;
+      // Adding a byte for the optionnal second param
+      if(-1 !== MIDIEvents.MIDI_2PARAMS_EVENTS.indexOf(events[i].subtype)) {
+        destination[index++] = events[i].param2;
+      }
+    // META / SYSEX events encoding
+    } else {
+      // Adding the event type byte
+      destination[index++] = events[i].type;
+      // Adding the META event subtype byte
+      if(events[i].type === MIDIEvents.EVENT_META) {
+        destination[index++] = events[i].subtype;
+      }
+      // Writing the event length bytes
+      if(events[i].length >>> 28) {
+        throw Error('Event #' + i + ': Maximum length reached (' +
+          events[i].length + '/134217728 max)');
+      }
+      if(events[i].length >>> 21) {
+        destination[index++] = ((events[i].length >>> 21) & 0x7F) | 0x80;
+      }
+      if(events[i].length >>> 14) {
+        destination[index++] = ((events[i].length >>> 14) & 0x7F) | 0x80;
+      }
+      if(events[i].length >>> 7) {
+        destination[index++] = ((events[i].length >>> 7) & 0x7F) | 0x80;
+      }
+      destination[index++] = (events[i].length & 0x7F);
+      if(events[i].type === MIDIEvents.EVENT_META) {
+        switch(events[i].subtype) {
+          case MIDIEvents.EVENT_META_SEQUENCE_NUMBER:
+            destination[index++] = events[i].msb;
+            destination[index++] = events[i].lsb;
+            break;
+          case MIDIEvents.EVENT_META_TEXT:
+          case MIDIEvents.EVENT_META_COPYRIGHT_NOTICE:
+          case MIDIEvents.EVENT_META_TRACK_NAME:
+          case MIDIEvents.EVENT_META_INSTRUMENT_NAME:
+          case MIDIEvents.EVENT_META_LYRICS:
+          case MIDIEvents.EVENT_META_MARKER:
+          case MIDIEvents.EVENT_META_CUE_POINT:
+            for(k = 0, l = events[i].length; k < l; k++) {
+              destination[index++] = events[i].data[k];
+            }
+            break;
+          case MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX:
+            destination[index++] = events[i].prefix;
+            break;
+          case MIDIEvents.EVENT_META_END_OF_TRACK:
+            break;
+          case MIDIEvents.EVENT_META_SET_TEMPO:
+            destination[index++] = (events[i].tempo >> 16);
+            destination[index++] = (events[i].tempo >> 8) & 0xFF;
+            destination[index++] = events[i].tempo & 0xFF;
+            break;
+          case MIDIEvents.EVENT_META_SMTPE_OFFSET:
+            if(strictMode && 23 < events[i].hour) {
+              throw new Error('Event #' + i + ': SMTPE offset hour value must be' +
+                ' part of 0-23.');
+            }
+            destination[index++] = events[i].hour;
+            if(strictMode && 59 < events[i].minutes) {
+              throw new Error('Event #' + i + ': SMTPE offset minutes value must' +
+                ' be part of 0-59.');
+            }
+            destination[index++] = events[i].minutes;
+            if(strictMode && 59 < events[i].seconds) {
+              throw new Error('Event #' + i + ': SMTPE offset seconds value must' +
+                ' be part of 0-59.');
+            }
+            destination[index++] = events[i].seconds;
+            if(strictMode && 30 < events[i].frames) {
+              throw new Error('Event #' + i + ': SMTPE offset frames amount must' +
+                ' be part of 0-30.');
+            }
+            destination[index++] = events[i].frames;
+            if(strictMode && 99 < events[i].subframes) {
+              throw new Error('Event #' + i + ': SMTPE offset subframes amount' +
+                ' must be part of 0-99.');
+            }
+            destination[index++] = events[i].subframes;
+            break;
+          case MIDIEvents.EVENT_META_KEY_SIGNATURE:
+            if('number' != typeof events[i].key || -7 > events[i].key ||
+              7 < events[i].scale) {
+              throw new Error('Event #' + i + ':The key signature key must be' +
+                ' between -7 and 7');
+            }
+            if('number' !== typeof events[i].scale ||
+              0 > events[i].scale || 1 < events[i].scale) {
+              throw new Error('Event #' + i + ':' +
+              'The key signature scale must be 0 or 1');
+            }
+            destination[index++] = events[i].key;
+            destination[index++] = events[i].scale;
+            break;
+          // Not implemented
+          case MIDIEvents.EVENT_META_TIME_SIGNATURE:
+          case MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC:
+          default:
+            for(k = 0, l = events[i].length; k < l; k++) {
+              destination[index++] = events[i].data[k];
+            }
+            break;
+        }
+      // Adding bytes corresponding to the sysex event datas
+      } else {
+        for(k = 0, l = events[i].length; k < l; k++) {
+          destination[index++] = events[i].data[k];
+        }
+      }
+    }
+  }
+};
+
+// Return the buffer length needed to encode the given events
+MIDIEvents.getRequiredBufferLength = function(events) {
+  var bufferLength = 0;
+  var i = 0;
+  var j;
+
+  // Calculating the track size by adding events lengths
+  for(i = 0, j = events.length; i < j; i++) {
+    // Computing necessary bytes to encode the delta value
+    bufferLength +=
+      events[i].delta >>> 21 ? 4 :
+        events[i].delta >>> 14 ? 3 :
+          events[i].delta >>> 7 ? 2 : 1;
+    // MIDI Events have various fixed lengths
+    if(events[i].type === MIDIEvents.EVENT_MIDI) {
+      // Adding a byte for subtype + channel
+      bufferLength++;
+      // Adding a byte for the first params
+      bufferLength++;
+      // Adding a byte for the optionnal second param
+      if(-1 !== MIDIEvents.MIDI_2PARAMS_EVENTS.indexOf(events[i].subtype)) {
+        bufferLength++;
+      }
+    // META / SYSEX events lengths are self defined
+    } else {
+      // Adding a byte for the event type
+      bufferLength++;
+      // Adding a byte for META events subtype
+      if(events[i].type === MIDIEvents.EVENT_META) {
+        bufferLength++;
+      }
+      // Adding necessary bytes to encode the length
+      bufferLength +=
+        events[i].length >>> 21 ? 4 :
+          events[i].length >>> 14 ? 3 :
+            events[i].length >>> 7 ? 2 : 1;
+      // Adding bytes corresponding to the event length
+      bufferLength += events[i].length;
+    }
+  }
+  return bufferLength;
+};
+
+module.exports = MIDIEvents;
+
+},{}],2:[function(require,module,exports){
+'use strict';
+
+var MIDIEvents = require('midievents');
+
+// Constants
+var PLAY_BUFFER_DELAY = 300;
+var PAGE_HIDDEN_BUFFER_RATIO = 20;
+
+// MIDIPlayer constructor
+function MIDIPlayer(options) {
+  var i;
+
+  options = options || {};
+  this.output = options.output || null; // midi output
+  this.volume = options.volume || 100; // volume in percents
+  this.startTime = -1; // ms since page load
+  this.pauseTime = -1; // ms elapsed before player paused
+  this.events = [];
+  this.notesOn = new Array(32); // notesOn[channel][note]
+  for(i = 31; 0 <= i; i--) {
+    this.notesOn[i] = [];
+  }
+  this.midiFile = null;
+  window.addEventListener('unload', this.stop.bind(this));
+}
+
+// Parsing all tracks and add their events in a single event queue
+MIDIPlayer.prototype.load = function(midiFile) {
+  this.stop();
+  this.position = 0;
+  this.midiFile = midiFile;
+  this.events = this.midiFile.getMidiEvents();
+};
+
+MIDIPlayer.prototype.play = function(endCallback) {
+  this.endCallback = endCallback;
+  if(0 === this.position) {
+    this.startTime = performance.now();
+    this.timeout = setTimeout(this.processPlay.bind(this), 0);
+    return 1;
+  }
+  return 0;
+};
+
+MIDIPlayer.prototype.processPlay = function() {
+  var elapsedTime = performance.now() - this.startTime;
+  var event;
+  var index;
+  var param2;
+  var bufferDelay = PLAY_BUFFER_DELAY * (
+    document.hidden || document.mozHidden || document.webkitHidden || document.msHidden || document.oHidden ?
+    PAGE_HIDDEN_BUFFER_RATIO : 1
+  );
+  event = this.events[this.position];
+  while(this.events[this.position] && event.playTime - elapsedTime < bufferDelay) {
+    param2 = 0;
+    if(event.subtype === MIDIEvents.EVENT_MIDI_NOTE_ON) {
+      param2 = Math.floor(event.param1 * ((this.volume || 1) / 100));
+      this.notesOn[event.channel].push(event.param1);
+    } 
+    else if(event.subtype === MIDIEvents.EVENT_MIDI_NOTE_OFF) {
+      index = this.notesOn[event.channel].indexOf(event.param1);
+      if(-1 !== index) {
+        this.notesOn[event.channel].splice(index, 1);
+      }
+    }
+    this.output.send(
+      -1 !== MIDIEvents.MIDI_1PARAM_EVENTS.indexOf(event.subtype) ?
+      [(event.subtype << 4) + event.channel, event.param1] :
+      [(event.subtype << 4) + event.channel, event.param1, (param2 || event.param2 || 0x00)],
+      Math.floor(event.playTime + this.startTime)
+    );
+    this.lastPlayTime = event.playTime + this.startTime;
+    this.position++;
+    event = this.events[this.position];
+  }
+  if(this.position < this.events.length - 1) {
+    this.timeout = setTimeout(this.processPlay.bind(this), PLAY_BUFFER_DELAY - 250);
+  } else {
+    setTimeout(this.endCallback, PLAY_BUFFER_DELAY + 100);
+    this.position = 0;
+  }
+};
+
+MIDIPlayer.prototype.pause = function() {
+  var i;
+  var j;
+
+  if(this.timeout) {
+    clearTimeout(this.timeout);
+    this.timeout = null;
+    this.pauseTime = performance.now();
+    for(i = this.notesOn.length - 1; 0 <= i; i--) {
+      for(j = this.notesOn[i].length - 1; 0 <= j; j--) {
+        this.output.send([(MIDIEvents.EVENT_MIDI_NOTE_OFF << 4) + i, this.notesOn[i][j],
+          0x00], this.lastPlayTime + 100);
+      }
+    }
+    return true;
+  }
+  return false;
+};
+
+MIDIPlayer.prototype.resume = function(endCallback) {
+  this.endCallback = endCallback;
+  if(this.events && this.events[this.position] && !this.timeout) {
+    this.startTime += performance.now() - this.pauseTime;
+    this.timeout = setTimeout(this.processPlay.bind(this), 0);
+    return this.events[this.position].playTime;
+  }
+  return 0;
+};
+
+MIDIPlayer.prototype.stop = function() {
+  var i;
+
+  if(this.pause()) {
+    this.position = 0;
+    for(i = 31; 0 <= i; i--) {
+      this.notesOn[i] = [];
+    }
+    return true;
+  }
+  return false;
+};
+
+module.exports = MIDIPlayer;
+
+},{"midievents":1}]},{},[2])(2)
+});
+ </script>
+ 
+ <script>
+ // MIDILyricsDisplayer : Shows MIDI lyrics in a given element
+
+var PLAY_BUFFER_DELAY=600;
+
+function MIDILyricsDisplayer(rootElement,options) {
+	this.rootElement=rootElement;
+	options=options||{};
+	this.timeouts=[];
+}
+
+// Parsing all tracks and add their events in a single event queue
+MIDILyricsDisplayer.prototype.loadLyrics = function(lyrics) {
+ 	// Empty old lyrics
+ 	while(this.rootElement.firstChild)
+ 		this.rootElement.removeChild(this.rootElement.firstChild)
+ 	// stopping previous timeout
+	if(this.timeout)
+		clearTimeout(this.timeout);
+	// Appending the first paragraph
+	var lineP=document.createElement('p'), lyricSpan;
+	this.rootElement.appendChild(lineP);
+	// Setting lyrics
+	for(i=0, j=lyrics.length; i<j; i++) {
+		if('\n'===lyrics[i].text[0]||'\\'===lyrics[i].text[0]
+			||'\r'===lyrics[i].text[0]||'/'===lyrics[i].text[0]) {
+			if(lineP.childNodes.length) {
+				lineP=document.createElement('p');
+				this.rootElement.appendChild(lineP);
+			}
+			lyrics[i].text=lyrics[i].text.substring(1);
+		}
+		if(lyrics[i].text) {
+			var lyricSpan=document.createElement('span');
+ 			lyricSpan.appendChild(document.createTextNode(lyrics[i].text));
+ 			lyricSpan.setAttribute('data-playtime', lyrics[i].playTime);
+ 			lineP.appendChild(lyricSpan);
+		}
+ 	}
+};
+
+MIDILyricsDisplayer.prototype.start = function(playTime) {
+	// cleanup
+	if(this.curP) {
+		this.curP.removeAttribute('class');
+		if(this.curP.previousSibling) {
+			this.curP.previousSibling.removeAttribute('class');
+			if(this.curP.previousSibling.previousSibling) {
+				this.curP.previousSibling.previousSibling.removeAttribute('class');
+			}
+		}
+		if(this.curP.nextSibling)
+			this.curP.nextSibling.removeAttribute('class');
+		for(var i=this.curP.childNodes.length-1; i>=0; i--) {
+			this.curP.childNodes[i].removeAttribute('class')
+		}
+	}
+	// saving start time
+	this.startTime=Date.now()-playTime;
+	// looping throught lyrics tu find the currently played
+	for(var i=0, j=this.rootElement.childNodes.length; i<j; i++) {
+		// if lyric paragraph is playing
+		if(i===j-1||parseInt(this.rootElement.childNodes[i+1]
+			.firstChild.getAttribute('data-playtime'),10)>playTime) {
+			// Setting previous paragraph class
+			if(i>0) {
+				this.rootElement.childNodes[i-1].setAttribute('class','popout');
+			}
+			// Setting next paragraph class
+			if(i<j-1) {
+				this.rootElement.childNodes[i+1].setAttribute('class','closetopop');
+			}
+			// Setting current paragraph classes
+			this.curP=this.rootElement.childNodes[i];
+			this.curP.setAttribute('class','pop');
+			for(i=0, j=this.curP.childNodes.length; i<j; i++) {
+				if(i===j-1||parseInt(this.curP.childNodes[i+1].getAttribute('data-playtime'),10)>playTime) {
+					this.lyricSpan=this.curP.childNodes[i];
+					break;
+				} else {
+					this.curP.childNodes[i].setAttribute('class','sing');
+				}
+			}
+			break;
+		}
+	}
+	if(this.lyricSpan) {
+			// programming the next sing
+			this.timeout=setTimeout(this.next.bind(this),Math.floor(
+				parseInt(this.lyricSpan.getAttribute('data-playtime'),10)
+				-playTime
+			));
+	}
+};
+
+MIDILyricsDisplayer.prototype.next = function() {
+	// Just jumped to a new paragraph
+	if(this.lyricSpan.parentNode.firstChild===this.lyricSpan) {
+		if(this.lyricSpan.parentNode.previousSibling) {
+			// hide the n-2 p
+			if(this.lyricSpan.parentNode.previousSibling.previousSibling) {
+				this.lyricSpan.parentNode.previousSibling.previousSibling.removeAttribute('class');
+			}
+			// mark the n-1 p
+			this.lyricSpan.parentNode.previousSibling.setAttribute('class','popout');
+			// remove sing classes
+			for(var i=this.lyricSpan.parentNode.previousSibling.childNodes.length-1; i>=0; i--) {
+				this.lyricSpan.parentNode.previousSibling.childNodes[i].removeAttribute('class')
+			}
+		}
+		// highlight the current p
+		this.lyricSpan.parentNode.setAttribute('class','pop');
+		// prepare the next p
+		if(this.lyricSpan.parentNode.nextSibling) {
+			this.lyricSpan.parentNode.nextSibling.setAttribute('class','closetopop');
+		}
+	}
+	this.lyricSpan.setAttribute('class','sing');
+	// finding the next span
+	if(this.lyricSpan.nextSibling) {
+		this.lyricSpan=this.lyricSpan.nextSibling;
+	} else if(this.curP.nextSibling&&this.curP.nextSibling.firstChild) {
+		this.lyricSpan=this.curP.nextSibling.firstChild;
+		this.lyricSpan=this.curP.nextSibling.firstChild;
+	} else {
+		this.lyricSpan=null;
+	}
+	if(this.lyricSpan) {
+		this.curP=this.lyricSpan.parentNode;
+		// programming the next sing
+		this.timeout=setTimeout(this.next.bind(this),Math.floor(
+			parseInt(this.lyricSpan.getAttribute('data-playtime'),10)
+			-(Date.now()-this.startTime)
+		));
+	}
+};
+
+MIDILyricsDisplayer.prototype.stop = function() {
+ 	// stopping previous timeout
+	if(this.timeout)
+		clearTimeout(this.timeout);
+};
+
+MIDILyricsDisplayer.prototype.setTextSize = function(event, params) {
+	var size=parseInt(this.rootElement.style.fontSize,10)||50;
+	if('smaller'===params.type&&size>10) {
+		this.rootElement.style.fontSize=(size-5)+'px';
+	} else if('bigger'===params.type) {
+		this.rootElement.style.fontSize=(size+5)+'px';
+	}
+};
+
+//module.exports = MIDILyricsDisplayer;
+
+
+ 
+ </script>
+
+    <!--link rel="stylesheet" type="text/css" href="styles.css"-->
+    <style>
+    /*! normalize.css v2.1.3 | MIT License | git.io/normalize */
+    article,aside,details,figcaption,figure,footer,header,hgroup,main,nav,section,summary{display:block}
+    audio,canvas,video{display:inline-block}
+    audio:not([controls]){display:none;height:0}[hidden],
+    template{display:none}
+    html{font-family:sans-serif;-ms-text-size-adjust:100%;-webkit-text-size-adjust:100%}
+    body{margin:0}
+    a{background:transparent}
+    a:focus{outline:thin dotted}
+    a:active,a:hover{outline:0}
+    h1{font-size:2em;margin:.67em 0}
+    abbr[title]{border-bottom:1px dotted}
+    b,strong{font-weight:bold}
+    dfn{font-style:italic}
+    hr{-moz-box-sizing:content-box;box-sizing:content-box;height:0}
+    mark{background:#ff0;color:#000}
+    code,kbd,pre,samp{font-family:monospace,serif;font-size:1em}
+    pre{white-space:pre-wrap}
+    q{quotes:"\201C" "\201D" "\2018" "\2019"}
+    small{font-size:80%}
+    sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}
+    sup{top:-0.5em}
+    sub{bottom:-0.25em}
+    img{border:0}
+    svg:not(:root){overflow:hidden}
+    figure{margin:0}
+    fieldset{border:1px solid silver;margin:0 2px;padding:.35em .625em .75em}
+    legend{border:0;padding:0}
+    button,input,select,textarea{font-family:inherit;font-size:100%;margin:0}
+    button,input{line-height:normal}
+    button,select{text-transform:none}
+    button,html input[type="button"],input[type="reset"],input[type="submit"]{-webkit-appearance:button;cursor:pointer}
+    button[disabled],html input[disabled]{cursor:default}
+    input[type="checkbox"],input[type="radio"]{box-sizing:border-box;padding:0}
+    input[type="search"]{-webkit-appearance:textfield;-moz-box-sizing:content-box;-webkit-box-sizing:content-box;box-sizing:content-box}
+    input[type="search"]::-webkit-search-cancel-button,input[type="search"]::-webkit-search-decoration{-webkit-appearance:none}
+    button::-moz-focus-inner,input::-moz-focus-inner{border:0;padding:0}
+    textarea{overflow:auto;vertical-align:top}
+    table{border-collapse:collapse;border-spacing:0}
+*,*:before,*:after {
+  -moz-box-sizing: border-box;
+  -webkit-box-sizing: border-box;
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased; }
+html{
+  height: 100%;
+}
+body {
+  position: relative;
+  background: #fff;
+  font-family: helvetica, arial, sans-serif;
+  /*font-size: 1em;*/
+  font-size: 1em;
+  height: 100%;
+}
+      #startup #prompt {
+        width: 200px;
+        background: #131313;
+        box-shadow: 0 0 20px rgba(0,0,0,0.6);
+        height: 20%;
+        width: 30%;
+        min-height: 180px;
+        border-radius: 5px;
+        z-index: 100;
+        position: absolute;
+        top: 35%;
+        left: 25%;
+        color: #fff;
+      }
+      
+      #mask {
+        position: absolute;
+        opacity: 0.5;
+        width: 100%;
+        left: 0;
+        top: 0;
+        height: 100%;
+        z-index: 4;
+        background: #000;
+      }
+      
+      #prompt input {
+        margin-top: 15px;
+        margin-left: 15px;
+      }
+      
+      
+      #search {
+        display: inline-block;
+        width: 80%;
+        height: 10%;
+        position: fixed;
+        top: 0;
+        z-index: 9;
+      }
+      
+      
+      #search input {
+        display: inline-block;
+        width: 100%;
+        border: none;
+        height: 100%;
+        padding-left: .5em;
+        outline: none;
+        background: transparent;
+        /*color: #131313;*/
+        color: #131313;
+        font-size: 1em;
+      }
+
+      ::-webkit-input-placeholder {
+         color: rgba(255,255,255,0.4);
+      }
+
+      :-moz-placeholder { /* Firefox 18- */
+         color: rgba(255,255,255,0.4);
+      }
+
+      ::-moz-placeholder {  /* Firefox 19+ */
+         color: rgba(255,255,255,0.4); 
+      }
+
+      :-ms-input-placeholder {  
+         color: rgba(255,255,255,0.4); 
+      }
+      audio {
+        width: 100%;
+        background-color: #95B9C7;
+      }
+      
+      #player-container {
+        display: inline-block;
+        position: fixed;
+        top: 0%;
+        right:10%;
+        width: 20%;
+        height: 10%;
+        background: transparent;
+      }
+      #player{
+        margin-top: 0;
+	
+      }
+      
+      #songs {
+        position: Absolute;
+        background: rgba(117,191,248, 1);
+        -webkit-animation: pulse 80s infinite alternate;
+        width: 60%;
+        height: 100%;
+        overflow: scroll;
+        padding-left: 5px;
+        top: 0;
+        padding-top: 5%;
+      }
+      @-webkit-keyframes pulse {
+      0% {background-color: rgba(248,117,117, 1);}
+      25% {background-color: rgba(217,171,255, 1);}
+     50% {background-color: rgba(243,248,117, 1);}
+     75% {background-color: rgba(165,248,117, 1);}
+     100% {background-color: rgba(117,191,248, 1);}
+}
+      #footer {
+        position: absolute;
+        bottom: 0;
+        width: 100%;
+        background: #858585;
+      }
+      
+      #songs table {
+        width: 100%;
+      }
+      
+      #playlist {
+        display: inline-block;
+width: 40%;
+height: 10%;
+position: fixed;
+right: 0;
+color: white;
+top: 0;
+padding-top: 10%;
+padding-bottom: 5%;
+overflow-y: scroll;
+overflow-x: hidden;
+background-color: #131313;
+      }
+     
+      #playlist table {
+        width: 100%;
+        margin: 5px;
+        margin-left: 10px;
+      }
+      
+      table tr:hover {
+        background: rgba(255,255,255,0.4);
+        border-radius: 5px;
+        color: #131313;
+        padding: 20px 0;
+      }
+      table tr {
+        padding: 10px 0;
+        -webkit-user-select: none;
+        user-select: none;
+        cursor: default;
+        
+      }
+      table td {
+        padding-top: 3px;
+        padding-bottom: 3px;
+        padding-right: 5px;
+      }
+      
+      
+      #playlist table tr.playing {
+        /*background: #76AD8B;*/
+        font-style: italic;
+      }
+      
+      #songs table tr.playing {
+        background: #76AD8B;
+        font-style: italic;
+      }
+      
+
+      #playlist table tr.playing td {
+        padding-left: 50px;
+      }
+      
+      #listtools {
+        display: inline-block;
+        position: fixed;
+        bottom: 0%;
+        right: 0;
+        color: #ddd;
+        height: 75%;
+        width: 40%;
+        background-color: #131313;
+      }
+      #listtools a {
+        color: gold;
+        text-decoration: none;
+      }
+      
+      tr.hidden {
+        display:none;
+      }
+      
+::-webkit-scrollbar {
+  width: 20px;
+  height: 0px;
+}
+::-webkit-scrollbar-thumb {
+  background-color: #000;
+  border-radius: 0 1px 1px 0;
+}
+::-webkit-scrollbar-track {
+  background: #121212;
+  box-shadow: inset 1px 1px 1px rgba(0,0,0, 0.2)
+}
+
+div.lyrics { width:100%; height:80%; bottom:5px; display:block; vertical-align:top; text-align:center; font-size:12px; overflow:auto}
+div.lyrics p { display:; color:#fff; font-weight:bold; margin:0; text-shadow:1px 1px 1px #000; }
+div.lyrics p.popout { display:block; color:#ccc;
+	animation-name: pip;
+	animation-duration: 0.5s;
+	animation-iteration-count: 1;
+	-webkit-animation-name: pip;
+	-webkit-animation-duration: 0.5s;
+	-webkit-animation-iteration-count: 1;
+	-moz-animation-name: pip;
+	-moz-animation-duration: 0.5s;
+	-moz-animation-iteration-count: 1;
+	-ms-animation-name: pip;
+	-ms-animation-duration: 0.5s;
+	-ms-animation-iteration-count: 1;
+	}
+div.lyrics p.closetopop { display:block; color:#ccc; 
+	animation-name: pop;
+	animation-duration: 0.5s;
+	animation-iteration-count: 1;
+	-webkit-animation-name: pop;
+	-webkit-animation-duration: 0.5s;
+	-webkit-animation-iteration-count: 1;
+	-moz-animation-name: pop;
+	-moz-animation-duration: 0.5s;
+	-moz-animation-iteration-count: 1;
+	-ms-animation-name: pop;
+	-ms-animation-duration: 0.5s;
+	-ms-animation-iteration-count: 1;
+}
+div.lyrics p.pop { display:block;
+}
+div.lyrics p.pop span.sing {
+	color: #F9BA1B;
+}
+    </style>
+    <script id="../dist/id3v2.js">
+    ID3v2 = {
+	parseStream: function(stream, onComplete){
+
+	var PICTURE_TYPES = {
+		"0": "Other",
+		"1": "32x32 pixels 'file icon' (PNG only)",
+		"2": "Other file icon",
+		"3": "Cover (front)",
+		"4": "Cover (back)",
+		"5": "Leaflet page",
+		"6": "Media (e.g. lable side of CD)",
+		"7": "Lead artist/lead performer/soloist",
+		"8": "Artist/performer",
+		"9": "Conductor",
+		"A": "Band/Orchestra",
+		"B": "Composer",
+		"C": "Lyricist/text writer",
+		"D": "Recording Location",
+		"E": "During recording",
+		"F": "During performance",
+		"10": "Movie/video screen capture",
+		"11": "A bright coloured fish", //<--- WTF?
+		"12": "Illustration",
+		"13": "Band/artist logotype",
+		"14": "Publisher/Studio logotype",
+	}
+
+	//from: http://bitbucket.org/moumar/ruby-mp3info/src/tip/lib/mp3info/id3v2.rb
+	//TODO: replace with something longer
+	var TAGS = {
+		"AENC": "Audio encryption",
+		"APIC": "Attached picture",
+		"COMM": "Comments",
+		"COMR": "Commercial frame",
+		"ENCR": "Encryption method registration",
+		"EQUA": "Equalization",
+		"ETCO": "Event timing codes",
+		"GEOB": "General encapsulated object",
+		"GRID": "Group identification registration",
+		"IPLS": "Involved people list",
+		"LINK": "Linked information",
+		"MCDI": "Music CD identifier",
+		"MLLT": "MPEG location lookup table",
+		"OWNE": "Ownership frame",
+		"PRIV": "Private frame",
+		"PCNT": "Play counter",
+		"POPM": "Popularimeter",
+		"POSS": "Position synchronisation frame",
+		"RBUF": "Recommended buffer size",
+		"RVAD": "Relative volume adjustment",
+		"RVRB": "Reverb",
+		"SYLT": "Synchronized lyric/text",
+		"SYTC": "Synchronized tempo codes",
+		"TALB": "Album",
+		"TBPM": "BPM",
+		"TCOM": "Composer",
+		"TCON": "Genre",
+		"TCOP": "Copyright message",
+		"TDAT": "Date",
+		"TDLY": "Playlist delay",
+		"TENC": "Encoded by",
+		"TEXT": "Lyricist",
+		"TFLT": "File type",
+		"TIME": "Time",
+		"TIT1": "Content group description",
+		"TIT2": "Title",
+		"TIT3": "Subtitle",
+		"TKEY": "Initial key",
+		"TLAN": "Language(s)",
+		"TLEN": "Length",
+		"TMED": "Media type",
+		"TOAL": "Original album",
+		"TOFN": "Original filename",
+		"TOLY": "Original lyricist",
+		"TOPE": "Original artist",
+		"TORY": "Original release year",
+		"TOWN": "File owner",
+		"TPE1": "Artist",
+		"TPE2": "Band",
+		"TPE3": "Conductor",
+		"TPE4": "Interpreted, remixed, or otherwise modified by",
+		"TPOS": "Part of a set",
+		"TPUB": "Publisher",
+		"TRCK": "Track number",
+		"TRDA": "Recording dates",
+		"TRSN": "Internet radio station name",
+		"TRSO": "Internet radio station owner",
+		"TSIZ": "Size",
+		"TSRC": "ISRC (international standard recording code)",
+		"TSSE": "Software/Hardware and settings used for encoding",
+		"TYER": "Year",
+		"TXXX": "User defined text information frame",
+		"UFID": "Unique file identifier",
+		"USER": "Terms of use",
+		"USLT": "Unsychronized lyric/text transcription",
+		"WCOM": "Commercial information",
+		"WCOP": "Copyright/Legal information",
+		"WOAF": "Official audio file webpage",
+		"WOAR": "Official artist/performer webpage",
+		"WOAS": "Official audio source webpage",
+		"WORS": "Official internet radio station homepage",
+		"WPAY": "Payment",
+		"WPUB": "Publishers official webpage",
+		"WXXX": "User defined URL link frame"
+	};
+
+	var TAG_MAPPING_2_2_to_2_3 = {
+		"BUF": "RBUF",
+		"COM": "COMM",
+		"CRA": "AENC",
+		"EQU": "EQUA",
+		"ETC": "ETCO",
+		"GEO": "GEOB",
+		"MCI": "MCDI",
+		"MLL": "MLLT",
+		"PIC": "APIC",
+		"POP": "POPM",
+		"REV": "RVRB",
+		"RVA": "RVAD",
+		"SLT": "SYLT",
+		"STC": "SYTC",
+		"TAL": "TALB",
+		"TBP": "TBPM",
+		"TCM": "TCOM",
+		"TCO": "TCON",
+		"TCR": "TCOP",
+		"TDA": "TDAT",
+		"TDY": "TDLY",
+		"TEN": "TENC",
+		"TFT": "TFLT",
+		"TIM": "TIME",
+		"TKE": "TKEY",
+		"TLA": "TLAN",
+		"TLE": "TLEN",
+		"TMT": "TMED",
+		"TOA": "TOPE",
+		"TOF": "TOFN",
+		"TOL": "TOLY",
+		"TOR": "TORY",
+		"TOT": "TOAL",
+		"TP1": "TPE1",
+		"TP2": "TPE2",
+		"TP3": "TPE3",
+		"TP4": "TPE4",
+		"TPA": "TPOS",
+		"TPB": "TPUB",
+		"TRC": "TSRC",
+		"TRD": "TRDA",
+		"TRK": "TRCK",
+		"TSI": "TSIZ",
+		"TSS": "TSSE",
+		"TT1": "TIT1",
+		"TT2": "TIT2",
+		"TT3": "TIT3",
+		"TXT": "TEXT",
+		"TXX": "TXXX",
+		"TYE": "TYER",
+		"UFI": "UFID",
+		"ULT": "USLT",
+		"WAF": "WOAF",
+		"WAR": "WOAR",
+		"WAS": "WOAS",
+		"WCM": "WCOM",
+		"WCP": "WCOP",
+		"WPB": "WPB",
+		"WXX": "WXXX"
+	};
+
+	//pulled from http://www.id3.org/id3v2-00 and changed with a simple replace
+	//probably should be an array instead, but thats harder to convert -_-
+	var ID3_2_GENRES = {
+		"0": "Blues",
+		"1": "Classic Rock",
+		"2": "Country",
+		"3": "Dance",
+		"4": "Disco",
+		"5": "Funk",
+		"6": "Grunge",
+		"7": "Hip-Hop",
+		"8": "Jazz",
+		"9": "Metal",
+		"10": "New Age",
+		"11": "Oldies",
+		"12": "Other",
+		"13": "Pop",
+		"14": "R&B",
+		"15": "Rap",
+		"16": "Reggae",
+		"17": "Rock",
+		"18": "Techno",
+		"19": "Industrial",
+		"20": "Alternative",
+		"21": "Ska",
+		"22": "Death Metal",
+		"23": "Pranks",
+		"24": "Soundtrack",
+		"25": "Euro-Techno",
+		"26": "Ambient",
+		"27": "Trip-Hop",
+		"28": "Vocal",
+		"29": "Jazz+Funk",
+		"30": "Fusion",
+		"31": "Trance",
+		"32": "Classical",
+		"33": "Instrumental",
+		"34": "Acid",
+		"35": "House",
+		"36": "Game",
+		"37": "Sound Clip",
+		"38": "Gospel",
+		"39": "Noise",
+		"40": "AlternRock",
+		"41": "Bass",
+		"42": "Soul",
+		"43": "Punk",
+		"44": "Space",
+		"45": "Meditative",
+		"46": "Instrumental Pop",
+		"47": "Instrumental Rock",
+		"48": "Ethnic",
+		"49": "Gothic",
+		"50": "Darkwave",
+		"51": "Techno-Industrial",
+		"52": "Electronic",
+		"53": "Pop-Folk",
+		"54": "Eurodance",
+		"55": "Dream",
+		"56": "Southern Rock",
+		"57": "Comedy",
+		"58": "Cult",
+		"59": "Gangsta",
+		"60": "Top 40",
+		"61": "Christian Rap",
+		"62": "Pop/Funk",
+		"63": "Jungle",
+		"64": "Native American",
+		"65": "Cabaret",
+		"66": "New Wave",
+		"67": "Psychadelic",
+		"68": "Rave",
+		"69": "Showtunes",
+		"70": "Trailer",
+		"71": "Lo-Fi",
+		"72": "Tribal",
+		"73": "Acid Punk",
+		"74": "Acid Jazz",
+		"75": "Polka",
+		"76": "Retro",
+		"77": "Musical",
+		"78": "Rock & Roll",
+		"79": "Hard Rock",
+		"80": "Folk",
+		"81": "Folk-Rock",
+		"82": "National Folk",
+		"83": "Swing",
+		"84": "Fast Fusion",
+		"85": "Bebob",
+		"86": "Latin",
+		"87": "Revival",
+		"88": "Celtic",
+		"89": "Bluegrass",
+		"90": "Avantgarde",
+		"91": "Gothic Rock",
+		"92": "Progressive Rock",
+		"93": "Psychedelic Rock",
+		"94": "Symphonic Rock",
+		"95": "Slow Rock",
+		"96": "Big Band",
+		"97": "Chorus",
+		"98": "Easy Listening",
+		"99": "Acoustic",
+		"100": "Humour",
+		"101": "Speech",
+		"102": "Chanson",
+		"103": "Opera",
+		"104": "Chamber Music",
+		"105": "Sonata",
+		"106": "Symphony",
+		"107": "Booty Bass",
+		"108": "Primus",
+		"109": "Porn Groove",
+		"110": "Satire",
+		"111": "Slow Jam",
+		"112": "Club",
+		"113": "Tango",
+		"114": "Samba",
+		"115": "Folklore",
+		"116": "Ballad",
+		"117": "Power Ballad",
+		"118": "Rhythmic Soul",
+		"119": "Freestyle",
+		"120": "Duet",
+		"121": "Punk Rock",
+		"122": "Drum Solo",
+		"123": "A capella",
+		"124": "Euro-House",
+		"125": "Dance Hall"
+		};
+		
+	var tag = {
+		pictures: []
+	};
+	
+	
+	var max_size = Infinity;
+	
+	function read(bytes, callback){
+		stream(bytes, callback, max_size);
+	}
+	
+	
+	function encode_64(input) {
+		var output = "", i = 0, l = input.length,
+		key = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=", 
+		chr1, chr2, chr3, enc1, enc2, enc3, enc4;
+		while (i < l) {
+			chr1 = input.charCodeAt(i++);
+			chr2 = input.charCodeAt(i++);
+			chr3 = input.charCodeAt(i++);
+			enc1 = chr1 >> 2;
+			enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
+			enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
+			enc4 = chr3 & 63;
+			if (isNaN(chr2)) enc3 = enc4 = 64;
+			else if (isNaN(chr3)) enc4 = 64;
+			output = output + key.charAt(enc1) + key.charAt(enc2) + key.charAt(enc3) + key.charAt(enc4);
+		}
+		return output;
+	}
+
+
+
+	function parseDuration(ms){
+		var msec = parseInt(cleanText(ms)) //leading nulls screw up parseInt
+		var secs = Math.floor(msec/1000);
+		var mins = Math.floor(secs/60);
+		var hours = Math.floor(mins/60);
+		var days = Math.floor(hours/24);
+	
+		return {
+			milliseconds: msec%1000,
+			seconds: secs%60,
+			minutes: mins%60,
+			hours: hours%24,
+			days: days
+		};
+	}
+
+
+	function pad(num){
+		var arr = num.toString(2);
+		return (new Array(8-arr.length+1)).join('0') + arr;
+	}
+
+	function arr2int(data){
+		if(data.length == 4){
+			if(tag.revision > 3){
+				var size = data[0] << 0x15;
+				size += data[1] << 14;
+				size += data[2] << 7;
+				size += data[3];
+			}else{
+				var size = data[0] << 24;
+				size += data[1] << 16;
+				size += data[2] << 8;
+				size += data[3];
+			}
+		}else{
+			var size = data[0] << 16;
+			size += data[1] << 8;
+			size += data[2];
+		}
+		return size;
+	}
+	
+	function parseImage(str){
+		var TextEncoding = str.charCodeAt(0);
+		str = str.substr(1);
+		var MimeTypePos = str.indexOf('\0');
+		var MimeType = str.substr(0, MimeTypePos);
+		str = str.substr(MimeTypePos+1);
+		var PictureType = str.charCodeAt(0);
+		var TextPictureType = PICTURE_TYPES[PictureType.toString(16).toUpperCase()];
+		str = str.substr(1);
+		var DescriptionPos = str.indexOf('\0');
+		var Description = str.substr(0, DescriptionPos);
+		str = str.substr(DescriptionPos+1);
+		var PictureData = str;
+		var Magic = PictureData.split('').map(function(e){return String.fromCharCode(e.charCodeAt(0) & 0xff)}).join('');
+		return {
+			dataURL: 'data:'+MimeType+';base64,'+encode_64(Magic),
+			PictureType: TextPictureType,
+			Description: Description,
+			MimeType: MimeType
+		};
+	}
+	
+	function parseImage2(str){
+		var TextEncoding = str.charCodeAt(0);
+		str = str.substr(1);
+		var Type = str.substr(0, 3);
+		str = str.substr(3);
+		
+		var PictureType = str.charCodeAt(0);
+		var TextPictureType = PICTURE_TYPES[PictureType.toString(16).toUpperCase()];
+		
+		str = str.substr(1);
+		var DescriptionPos = str.indexOf('\0');
+		var Description = str.substr(0, DescriptionPos);
+		str = str.substr(DescriptionPos+1);
+		var PictureData = str;
+		var Magic = PictureData.split('').map(function(e){return String.fromCharCode(e.charCodeAt(0) & 0xff)}).join('');
+		return {
+			dataURL: 'data:img/'+Type+';base64,'+encode_64(Magic),
+			PictureType: TextPictureType,
+			Description: Description,
+			MimeType: MimeType
+		};
+	}
+
+	var TAG_HANDLERS = {
+		"APIC": function(size, s, a){
+			tag.pictures.push(parseImage(s));
+		},
+		"PIC": function(size, s, a){
+			tag.pictures.push(parseImage2(s));
+		},
+		"TLEN": function(size, s, a){
+			tag.Length = parseDuration(s);
+		},
+		"TCON": function(size, s, a){
+			s = cleanText(s);
+			if(/\([0-9]+\)/.test(s)){
+				var genre = ID3_2_GENRES[parseInt(s.replace(/[\(\)]/g,''))]
+			}else{
+				var genre = s;
+			}
+			tag.Genre = genre;
+		}
+	};
+
+	function read_frame(){
+		if(tag.revision < 3){
+			read(3, function(frame_id){
+				//console.log(frame_id)
+				if(/[A-Z0-9]{3}/.test(frame_id)){
+					var new_frame_id = TAG_MAPPING_2_2_to_2_3[frame_id.substr(0,3)];
+					read_frame2(frame_id, new_frame_id);
+				}else{
+					onComplete(tag);
+					return;
+				}
+			})
+		}else{
+			read(4, function(frame_id){
+				//console.log(frame_id)
+				if(/[A-Z0-9]{4}/.test(frame_id)){
+					read_frame3(frame_id);
+				}else{
+					onComplete(tag);
+					return;
+				}
+			})
+		}
+	}
+	
+	
+	function cleanText(str){
+		if(str.indexOf('http://') != 0){
+			var TextEncoding = str.charCodeAt(0);
+			str = str.substr(1);
+		}
+		//screw it i have no clue
+		return str.replace(/[^A-Za-z0-9\(\)\{\}\[\]\!\@\#\$\%\^\&\* \/\"\'\;\>\<\?\,\~\`\.\n\t]/g,'');
+	}
+	
+	
+	function read_frame3(frame_id){
+		read(4, function(s, size){
+			var intsize = arr2int(size);
+			read(2, function(s, flags){
+				flags = pad(flags[0]).concat(pad(flags[1]));
+				read(intsize, function(s, a){
+					if(typeof TAG_HANDLERS[frame_id] == 'function'){
+						TAG_HANDLERS[frame_id](intsize, s, a);
+					}else if(TAGS[frame_id]){
+						tag[TAGS[frame_id]] = (tag[TAGS[frame_id]]||'') + cleanText(s)
+					}else{
+						tag[frame_id] = cleanText(s)
+					}
+					read_frame();
+				})
+			})
+		})
+	}
+	
+	function read_frame2(v2ID, frame_id){
+		read(3, function(s, size){
+			var intsize = arr2int(size);
+			read(intsize, function(s, a){
+				if(typeof TAG_HANDLERS[v2ID] == 'function'){
+					TAG_HANDLERS[v2ID](intsize, s, a);
+				}else if(typeof TAG_HANDLERS[frame_id] == 'function'){
+					TAG_HANDLERS[frame_id](intsize, s, a);
+				}else if(TAGS[frame_id]){
+					tag[TAGS[frame_id]] = (tag[TAGS[frame_id]]||'') + cleanText(s)
+				}else{
+						tag[frame_id] = cleanText(s)
+					}
+									//console.log(tag)
+				read_frame();
+			})
+		})
+	}
+	
+	
+	read(3, function(header){
+		if(header == "ID3"){
+			read(2, function(s, version){
+				tag.version = "ID3v2."+version[0]+'.'+version[1];
+				tag.revision = version[0];
+				//console.log('version',tag.version);
+				read(1, function(s, flags){
+					//todo: parse flags
+					flags = pad(flags[0]);
+					read(4, function(s, size){
+						max_size = arr2int(size);
+						read(0, function(){}); //signal max
+						read_frame()
+					})
+				})
+			})
+		}else{
+			onComplete(tag);
+			return false; //no header found
+		}
+	})
+	return tag;
+},
+
+parseURL: function(url, onComplete){
+	var xhr = new XMLHttpRequest();
+	xhr.open('get', url, true);
+	xhr.overrideMimeType('text/plain; charset=x-user-defined');
+
+	var pos = 0, 
+			bits_required = 0, 
+			handle = function(){},
+			maxdata = Infinity;
+
+	function read(bytes, callback, newmax){
+		bits_required = bytes;
+		handle = callback;
+		maxdata = newmax;
+		if(bytes == 0) callback('',[]);
+	}
+	var responseText = '';
+	(function(){
+		if(xhr.responseText){
+			responseText = xhr.responseText;
+		}
+		if(xhr.responseText.length > maxdata) xhr.abort();
+
+		if(responseText.length > pos + bits_required && bits_required){
+			var data = responseText.substr(pos, bits_required);
+			var arrdata = data.split('').map(function(e){return e.charCodeAt(0) & 0xff});
+			pos += bits_required;
+			bits_required = 0;
+			if(handle(data, arrdata) === false){
+				xhr.abort();
+				return;
+			}
+		}
+		setTimeout(arguments.callee, 0);
+	})()
+	xhr.send(null);
+	return [xhr, ID3v2.parseStream(read, onComplete)];
+},
+parseFile: function(file, onComplete){
+
+	var reader = new FileReader();
+
+	var pos = 0, 
+			bits_required = 0, 
+			handle = function(){},
+			maxdata = Infinity;
+
+	function read(bytes, callback, newmax){
+		bits_required = bytes;
+		handle = callback;
+		maxdata = newmax;
+		if(bytes == 0) callback('',[]);
+	}
+	var responseText = '';
+	reader.onload = function(){
+		responseText = reader.result;
+	};
+
+	(function(){
+	
+		if(responseText.length > pos + bits_required && bits_required){
+			var data = responseText.substr(pos, bits_required);
+			var arrdata = data.split('').map(function(e){return e.charCodeAt(0) & 0xff});
+			pos += bits_required;
+			bits_required = 0;
+			if(handle(data, arrdata) === false){
+				return;
+			}
+		}
+		setTimeout(arguments.callee, 0);
+	})()
+	reader.readAsBinaryString(fileSlice(file, 0, 128 * 1024));
+	return [reader, ID3v2.parseStream(read, onComplete)];
+}
+}
+
+
+function fileSlice(file, start, length){
+  if(file.mozSlice) return file.mozSlice(start, start + length);
+  if(file.webkitSlice) return file.webkitSlice(start, start + length);
+  if(file.slice) return file.slice(start, length);
+}
+
+
+//doesnt quite belong here but doesnt quite belong elsewhere either
+function guessSong(n){
+	var parts = unescape(n)
+		.replace(/^.*(music|desktop|document|video|home)/gi,'')
+		.replace(/\[[^\]]+\]/g,'')
+		.replace(/_/g,' ')
+		.replace(/[0-9]+\s*(kbps|\-)/,'')
+		.split(/[\/]/)
+		.reverse();
+
+	var name = parts[0]
+		.replace(/\.(mp3|ogg|flac)/,'')
+		.replace(/^\s|\s$/g,'')
+		.replace(/^\d+\s*/,'');
+
+	var artist='Unknown',album='Unknown';
+
+	if(/\-/.test(name)){
+		var np = name.split('-').reverse();
+		name = np[0];
+		if(np.length >= 2){
+			artist = np[1];
+		}
+		if(np.length >= 3){
+			artist = np[2];
+			album = np[1]
+		}
+		if(parts[1] && parts[2]){
+			var album = parts[2]
+				.replace(/^\s|\s$/g,'');
+			if(!album){
+				album = parts[1]
+				.replace(/^\s|\s$/g,'');
+			}
+		}
+	}else{
+		if(parts[1]){
+			var album = parts[1]
+			.replace(/^\s|\s$/g,'')
+		}
+		if(parts[2]){
+			var artist = parts[2]
+				.replace(/^\s|\s$/g,'')
+				.replace(/^\d+\s*/,'');
+		}
+	}
+	if(/\-/.test(album)){
+		var as = album.split('-');
+		album = as[1];
+		if(!artist){
+			artist = as[0];
+		}
+	}
+	return {
+		Title: name,
+		Artist: artist,
+		Album: album
+	}
+}
+    </script>
+    <script>
+      //beware! this code is pretty hacky and  ugly.
+      /*
+        This doesn't use jQuery or any js libraries, not because they aren't great
+        in retrospect, I really think I should have used jQuery here.
+        
+        But yesterday when I started this, I was really offended by a chrome extension
+        which was literally a one liner content script that had jquery as a dependency.
+        
+        That's just terrible.
+        
+        Anyway, this is more of a proof of concept and in a weird backwards way, I prefer
+        to do my prototypes without jQuery.
+      */
+      //var mid='mid',kar='kar',midi='midi',rmi='rmi';
+      /*
+      function endedFile(url){
+        var temp;
+        if
+      };
+      */
+      function parseFile(file, callback){
+        if(localStorage[file.name]) 
+          return callback(JSON.parse(localStorage[file.name]));
+        ID3v2.parseFile(file,function(tags){
+          //to not overflow localstorage
+          localStorage[file.name] = JSON.stringify({
+            Title: tags.Title,
+            Artist: tags.Artist,
+            Album: tags.Album,
+            Genre: tags.Genre
+          });
+          callback(tags);
+        })
+      }
+      
+      function runSearch(query){
+        console.log(query);
+        var regex = new RegExp(query.trim().replace(/\s+/g, '.*'), 'ig');
+        for(var i = $('songtable').getElementsByTagName('tr'), l = i.length; l--;){
+          if(regex.test(i[l].innerHTML)){
+            i[l].className = 'visible'
+          }else{
+            i[l].className = 'hidden';
+          }
+        }
+      }
+      
+      function canPlay(type){
+        var a = document.createElement('audio');
+        return !!(a.canPlayType && a.canPlayType(type).replace(/no/, ''));
+      }
+      
+      function $(id){return document.getElementById(id)}
+      function getSongs(files){
+        $("mask").style.display = 'none';
+        $("startup").style.display = 'none';
+        var queue = [];
+        var mp3 = canPlay('audio/mpeg;'), 
+            ogg = canPlay('audio/ogg; codecs="vorbis"');
+        for(var i = 0; i < files.length; i++){
+          var file = files[i];
+	  
+	        var path = file.webkitRelativePath || file.mozFullPath || file.name;
+          if (path.indexOf('.AppleDouble') != -1) {
+          // Meta-data folder on Apple file systems, skip
+		        continue;
+          }         
+	        var size = file.size || file.fileSize || 4096;
+	        if(size < 4095) { 
+		        // Most probably not a real MP3
+		        console.log(path);
+		        continue;
+	        }
+ 
+          if(file.name.indexOf('mp3') != -1){ //only does mp3 for now
+            if(mp3){
+              queue.push(file);
+            }
+          }
+          if(file.name.indexOf('ogg') != -1  || file.name.indexOf('oga') != -1){
+            if(ogg){
+              queue.push(file);
+            }
+          }
+          
+          if(file.name.indexOf('mid') != -1){
+              queue.push(file);
+          }
+
+          if(file.name.indexOf('kar') != -1){
+              queue.push(file);
+          }
+          
+          if(file.name.indexOf('midi') != -1){
+              queue.push(file);
+          }
+          if(file.name.indexOf('rmi') != -1){
+              queue.push(file);
+          }
+
+          
+        }
+                                
+        var process = function(){
+          if(queue.length){
+            
+            var f = queue.shift();
+            parseFile(f,function(tags){
+              console.log(tags);
+              var tr = document.createElement('tr');
+              var t2 = guessSong(f.webkitRelativePath || f.mozFullPath || f.name); 
+              //it should be innerText/contentText but its annoying.
+              
+              var td = document.createElement('td');
+              td.innerHTML = f.name;
+              tr.appendChild(td);
+              
+              var td = document.createElement('td');
+              td.innerHTML = tags.Title || t2.Title;
+              tr.appendChild(td);
+              
+              var td = document.createElement('td');
+              td.innerHTML = tags.Artist || t2.Artist;
+              tr.appendChild(td);
+              
+              var td = document.createElement('td');
+              td.innerHTML = tags.Album || t2.Album;
+              tr.appendChild(td);
+              
+              var td = document.createElement('td');
+              td.innerHTML = tags.Genre || "";
+              tr.appendChild(td);
+             
+                tr.onclick = function(e){
+                  if(e && e.button == 1){
+                    tr.parentNode.removeChild(tr);
+                  }
+                  else{
+                    var url;
+                    if(window.createObjectURL){
+                      url = window.createObjectURL(f)
+                    }
+                    else if(window.createBlobURL){
+                      url = window.createBlobURL(f)
+                    }
+                    else if(window.URL && window.URL.createObjectURL){
+                      url = window.URL.createObjectURL(f)
+                    }
+                    else if(window.webkitURL && window.webkitURL.createObjectURL){
+                      url = window.webkitURL.createObjectURL(f)
+                    }
+                    
+                    if(f.name.indexOf('kar') != -1){
+                      document.getElementById("player").style.display='none';
+                      document.getElementById("midiHolder").style.display='';
+                      document.getElementById("midiPanel").style.display='';
+                      $("player").pause();
+                      downloadFile(url);
+                      
+                    }
+                    if(f.name.indexOf('mid') != -1){
+                      document.getElementById("player").style.display='none';
+                      document.getElementById("midiHolder").style.display='';
+                      document.getElementById("midiPanel").style.display='';
+                      $("player").pause();
+                      downloadFile(url);
+                      
+                    }
+                    if(f.name.indexOf('midi') != -1){
+                      document.getElementById("player").style.display='none';
+                      document.getElementById("midiHolder").style.display='';
+                      document.getElementById("midiPanel").style.display='';
+                      $("player").pause();
+                      downloadFile(url);
+                      
+                    }
+                    if(f.name.indexOf('rmi') != -1){
+                      document.getElementById("player").style.display='none';
+                      document.getElementById("midiHolder").style.display='';
+                      document.getElementById("midiPanel").style.display='';
+
+                      $("player").pause();
+                      downloadFile(url);
+                      
+                    }
+                    
+                    
+                    if(f.name.indexOf('mp3') != -1){
+                    document.getElementById("midiHolder").style.display='none';
+                    document.getElementById("midiPanel").style.display='none';
+                    stop();
+                    document.getElementById("player").style.display='';
+                      $("player").src = url;
+                      $("player").play();
+                    }
+                    
+                    if(f.name.indexOf('ogg') != -1){
+                    document.getElementById("midiHolder").style.display='none';
+                    document.getElementById("midiPanel").style.display='none';
+                    stop();
+                    document.getElementById("player").style.display='';
+                      $("player").src = url;
+                      $("player").play();
+                    }
+                    
+                    if(f.name.indexOf('oga') != -1){
+                    document.getElementById("midiHolder").style.display='none';
+                    document.getElementById("midiPanel").style.display='none';
+                    stop();
+                    document.getElementById("player").style.display='';
+                      $("player").src = url;
+                      $("player").play();
+                    }
+                    
+                    
+                    
+                    for(var i = document.querySelectorAll('.playing'), l = i.length; l--;){
+                      i[l].className = '';
+                    }
+                    /////////////////////
+                    tr.className += ' playing';
+                    currentSong = tr;
+                    /////////////////////////////////////
+                    //document.title=tags.Title || t2.Title;
+                    //document.title=f.name;
+                    documentTitle(f.name,300,15)
+                    playIndicator(f.name||tags.Artist+"-"+tags.Title||t2.Artist+"-"+t2.Title);
+                    
+                  }
+                }
+                if($("songtable").childNodes.length == 1) 
+                  tr.onclick();
+             // }
+              $('songtable').appendChild(tr);
+              process();
+            })
+            var lq = queue.length;
+            setTimeout(function(){
+              if(queue.length == lq){
+                process();
+              }
+            },300);
+          }
+        }
+        process();
+        
+        console.log(files);
+      }
+
+      var currentSong = 0;
+
+      function nextSong(){
+        try{
+          currentSong.nextSibling.onclick(); 
+        }
+        catch(e){
+          currentSong = document.querySelector("#songtable tr");
+          currentSong.onclick();
+        }
+      }
+      
+      function shuffle(){
+        var pt = document.getElementById('songtable');
+        //fisher yates shuffle. hopefully.
+        for(var i = document.querySelectorAll("#songtable tr"), l = i.length;  l--;){
+          var j = Math.floor(Math.random() * l);
+          var jel = i[j], 
+              iel = i[l];
+          var jref = jel.nextSibling, 
+              iref = iel.nextSibling;
+          pt.insertBefore(jel, iref);
+          pt.insertBefore(iel, jref);
+        }
+      }
+      
+      function empty(){
+        var pt = document.getElementById('songtable');
+        pt.innerHTML = '';
+      }
+      ///////////////
+     function emptysongtable(){
+        var st = document.getElementById('songtable');
+        st.innerHTML = '';
+      }
+      ///////////////
+      
+      /*function playIndicator(strings){
+        var pt = document.getElementById('playlist');
+        pt.innerHTML = strings;
+      }*/
+      function playIndicator(strings){
+        var pt = document.getElementById('indikator');
+        pt.innerHTML = strings;
+      }
+
+      //////////////////////
+      onload = function(){
+        
+        //with no dependencies, it should be fine to use this instead of ondomcontentloaded
+        var a = document.createElement('audio');
+        if(!a.canPlayType) $("support").innerHTML += "Your browser does not support HTML5 Audio<br>";
+        if(!(a.canPlayType && a.canPlayType('audio/ogg; codecs="vorbis"').replace(/no/, ''))) 
+          $("support").innerHTML += "Your browser does not support Ogg Vorbis Playback<br>";
+        if(!(a.canPlayType && a.canPlayType('audio/mpeg;').replace(/no/, ''))) 
+          $("support").innerHTML += "Your browser does not support MP3 Playback<br>";
+        var f = document.createElement('input');
+        f.type = 'file';
+        if(!('multiple' in f)) 
+          $("support").innerHTML += "Your browser does not support selecting multiple files<br>";
+        if(!('webkitdirectory' in f)) 
+          $("support").innerHTML += "Your browser probably does not support selecting directories<br>";
+        if(window.createObjectURL){
+        }
+        else if(window.createBlobURL){
+        }
+        else if(window.URL && window.URL.createObjectURL){
+        }
+        else if(window.webkitURL && window.webkitURL.createObjectURL){
+        }
+        else{
+          $("support").innerHTML += "Your browser probably does not support Object URLs<br>";
+        }
+        
+        document.querySelector('#search input').onkeydown = function(e){
+          if(e.keyCode == 13){
+            for(var i = document.querySelectorAll('#songtable tr.visible'), l = i.length; l--;){
+              i[l].onclick();
+            }
+          }
+        }
+      }
+    </script>
+  </head>
+  <body>
+   
+    
+    <!-- Start screen popup -->
+    <div id="mask"></div>
+    <div id="startup">
+      <div id="prompt">
+      <p style="padding: 15px">
+          Select your folder, search your songs, create a plalist and listen to your tracks!
+        </p>
+          <input type="file" webkitdirectory directory multiple mozdirectory onchange="getSongs(this.files)">
+      </div>
+      <div id="support" style="position:absolute;z-index:99999;color:red;font-size:x-large"> <!-- insert cheap knockoff modernizer clone -->
+      
+      </div>
+    </div>
+    <!-- player ui -->
+    <div id="search">
+      <input type="text" placeholder="Search: Song, Artist or Album" spellcheck=off autocomplete=on oninput="runSearch(this.value)">
+     
+    </div>
+    <div id="playlist">
+      <marquee id='indikator'></marquee>
+      <!--table id="playtable"></table-->
+    </div>
+    
+    <div id="listtools">
+      <!--a href="javascript:shuffle()">Shuffle</a> / 
+      <a href="javascript:empty()">Clear</a-->
+      
+      <button onclick="shuffle()">Shuffle</button>
+      <button onclick="empty()">Clear</button>
+      <a><input type="file" webkitdirectory directory multiple mozdirectory onchange="getSongs(this.files)"> </a>
+      
+		  <div id='midiPanel'>
+		  <p>
+			  <label>Pick a MIDI file:
+			  <input type="file" onchange="stop();readFile(this)" accept="audio/x-midi" /></label><br />
+        <button type="button" onclick="run()">Play</button>
+        <button type="button" onclick="stop()">Stop</button>
+      
+      
+       
+        <button type="button" onclick="panic()">Panic</button>
+        <button id='tb' type="button" onclick="toggle_output('choosoutput')">output</button>
+        <div class="lyrics"></div>
+        <div class="app" style="display:block">
+		  
+      </p>
+      </div>
+	  </div>
+    </div>
+    
+    <div id="songs">
+      <table id="songtable" cellspacing=0 cellpadding=0></table>
+    </div>
+    
+    <div id="player-container">
+      <div id='midiHolder'>
+			  <label id='choosoutput'>Choose output
+				  <select id="inputportselector"></select>
+			  </label>
+      
+      </div>
+      
+      <!--audio onended="nextSong()" controls id="player"></audio-->
+    </div>
+      
+    <div id="footer">
+      <audio onended="nextSong()" controls id="player">
+    </div>
+    
+    <script type="text/javascript">
+
+  function toggle_output(id) {
+       var butt=document.getElementById('tb');
+       var e = document.getElementById(id).style;
+       if(e.display == 'block'){
+          e.display = 'none';
+          butt.innerHTML="Disp. Output"
+        }  
+       else{
+          e.display = 'block';
+          butt.innerHTML="Hide Output"
+       }
+  };
+  
+    var midientri=null;
+    
+		var midiAccess;
+		var midiPlayer;
+		var outputs;
+    //var evts = new MIDIEvents();
+    var lyricsDisplayer = new MIDILyricsDisplayer(document.querySelector('div.lyrics'));
+		// Requesting Midi Access
+		navigator.requestMIDIAccess().then(function onsuccesscallback(access) {
+		  outputs = access.outputs;
+      var iter = outputs.values();
+      var output;
+      while(output = iter.next()) {
+        if(output.done) {
+          break;
+        }
+        var opt = document.createElement('option');
+        opt.value = output.value.id;
+        opt.text = output.value.name;
+        document.getElementById('inputportselector').add(opt);
+        midiPlayer = new MIDIPlayer({output: outputs.get(
+				  document.getElementById('inputportselector').value
+				)});
+        downloadFile('Hello.mid')
+      }
+       
+		},
+    function onerrorcallback(err) {
+		  console.log('uh-oh! Something went wrong!  Error code: ' + err.code);
+		});
+
+		// File handlers
+		function readFile(input) {
+      midientri=null;
+			var reader = new FileReader();
+			reader.readAsArrayBuffer(input.files[0]);
+			reader.onloadend = function(event) {
+				playFile(event.target.result);
+        midientri=event.target.result;
+        //document.title=input.files[0].name;
+        documentTitle(input.files[0].name,300,15)
+   		}
+   	}
+    //////////////////////
+    function run(){
+      playFile(midientri);
+    }
+    ///////////////////////////////
+     //////////////////////
+    function stop(){
+      midientri=null;    
+      if(midiPlayer) {
+				midiPlayer.stop();
+        lyricsDisplayer.stop()
+		    panic();
+      }
+    };
+    ///////////////////////////////
+   
+     
+		function downloadFile(url) {
+    midientri=null;
+		//	if(!input.value)
+		//		return;
+			var oReq = new XMLHttpRequest();
+			oReq.open('GET', url, true);
+			oReq.responseType = 'arraybuffer';
+			oReq.onload = function(oEvent) {
+      
+				playFile(oReq.response);
+        midientri=oReq.response;
+			};
+			oReq.send(null);
+   	}
+    ///////////////////////////////
+    function panic(){
+      midientri=null;
+      for(var i=0; i<16; i++) {
+        var data=[parseInt("0xb"+i.toString(16), 16), 0x78, 0x00];
+        midiPlayer.output.send(data, 0);
+      }
+    };
+    ////////////////////////////////
+		// Player
+		function playFile(buffer) {
+     
+  		var outputKeys = [];
+			// testing output
+			if(outputs) {
+				// Stopping previous play if exists
+				if(midiPlayer) {
+					midiPlayer.stop();
+          panic()
+				}
+
+				// Creating player
+				midiPlayer = new MIDIPlayer({output: outputs.get(
+				  document.getElementById('inputportselector').value
+				)});
+        
+        Midivolume(0,midiPlayer);
+
+				// creating the MidiFile instance from a buffer (view MIDIFile README)
+				midiFile = new MIDIFile(buffer);
+				midiPlayer.load(midiFile);
+        midiPlayer.processPlay();
+        lyricsDisplayer.loadLyrics(midiFile.getLyrics());
+        var playtime;
+        if((playTime = midiPlayer.play(function() {
+					console.log('Play ended.');
+				}))) {
+    
+          lyricsDisplayer.start(1||playtime);
+    
+        }
+
+				// Playing
+				midiPlayer.play(function() {
+					console.log('Play ended.');
+				});
+				console.log('Playing.');
+
+			}
+      else {
+				console.log('No access to MIDI output.');
+			}
+		};
+    
+    function Midivolume(params,obj) {
+      var vol=0;
+      if (params<0) vol=0;
+	    if (params>100) vol=100;
+		  obj.volume=vol;
+    };
+ 
+    
+function documentTitle(CurrentTitle,selang,banyakhuruf){
+  function MovingTitle(writeText, interval, visibleLetters) {
+    var _instance = {};
+
+    var _currId = 0;
+    var _numberOfLetters = writeText.length;
+
+    function updateTitle() {
+        document.title='';
+        _currId += 1;
+        if(_currId > _numberOfLetters - 1) {
+            _currId = 0; 
+        }
+
+        var startId = _currId;
+        var endId = startId + visibleLetters;
+        var finalText;
+        if(endId < _numberOfLetters - 1) {
+            finalText = writeText.substring(startId, endId);
+        } else {
+            var cappedEndId = _numberOfLetters;
+            endId = endId - cappedEndId;
+
+            finalText = writeText.substring(startId, cappedEndId) +     writeText.substring(0, endId);
+        }
+
+        document.title = finalText; 
+    }
+
+    _instance.init = function() {
+        setInterval(updateTitle, interval);
+    };
+
+    return _instance;
+  }
+//var title = new MovingTitle("Desired title... ", 300, 10);
+var title = new MovingTitle(CurrentTitle+" --- ",selang,banyakhuruf);
+title.init();
+}
+</script>
+  </body>
+</html>
+
