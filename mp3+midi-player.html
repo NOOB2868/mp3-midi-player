@@ -4,444 +4,10 @@
     <title>MP3 Player</title>
     
     <link rel="icon"  type="image/png" href="16.png">
-       <!-- WebMidiAPI polyfill -->
- <script id='../http//cwilso.github.io/WebMIDIAPIShim/lib/WebMIDIAPI.js'>
- /* Copyright 2013 Chris Wilson
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
-
-// Initialize the MIDI library.
-(function (global) {
-    'use strict';
-    var midiIO, 
-        _requestMIDIAccess, 
-        MIDIAccess, 
-        _onReady, 
-        MIDIPort, 
-        MIDIInput, 
-        MIDIOutput, 
-        _midiProc;
-
-    function Promise() {}
-
-    Promise.prototype.then = function(accept, reject) {
-        this.accept = accept; 
-        this.reject = reject;
-    }
-
-    Promise.prototype.succeed = function(access) {
-        if (this.accept)
-            this.accept(access);
-    }
-
-    Promise.prototype.fail = function(error) {
-        if (this.reject)
-            this.reject(error);
-    }
-////////////////////////////////////////////////
-    function _JazzInstance() {
-        this.inputInUse = false;
-        this.outputInUse = false;
-
-        // load the Jazz plugin
-        var o1 = document.createElement("object");
-        o1.id = "_Jazz" + Math.random() + "ie";
-        o1.classid = "CLSID:1ACE1618-1C7D-4561-AEE1-34842AA85E90";
-
-        this.activeX = o1;
-
-        var o2 = document.createElement("object");
-        o2.id = "_Jazz" + Math.random();
-        o2.type="audio/x-jazz";
-        o1.appendChild(o2);
-
-        this.objRef = o2;
-
-        var e = document.createElement("p");
-        e.appendChild(document.createTextNode("This page requires the "));
-
-        var a = document.createElement("a");
-        a.appendChild(document.createTextNode("Jazz plugin"));
-        a.href = "http://jazz-soft.net/";
-
-        e.appendChild(a);
-        e.appendChild(document.createTextNode("."));
-        o2.appendChild(e);
-
-        var insertionPoint = document.getElementById("MIDIPlugin");
-        if (!insertionPoint) {
-            // Create hidden element
-            var insertionPoint = document.createElement("div");
-            insertionPoint.id = "MIDIPlugin";
-            insertionPoint.style.position = "absolute";
-            insertionPoint.style.visibility = "hidden";
-            insertionPoint.style.left = "-9999px";
-            insertionPoint.style.top = "-9999px";
-            document.body.appendChild(insertionPoint);
-        }
-        insertionPoint.appendChild(o1);
-
-        if (this.objRef.isJazz)
-            this._Jazz = this.objRef;
-        else if (this.activeX.isJazz)
-            this._Jazz = this.activeX;
-        else
-            this._Jazz = null;
-        if (this._Jazz) {
-            this._Jazz._jazzTimeZero = this._Jazz.Time();
-            this._Jazz._perfTimeZero = window.performance.now();
-        }
-    }
-/////////////////////////////////////////////////////////////////
-    _requestMIDIAccess = function _requestMIDIAccess() {
-        var access = new MIDIAccess();
-        return access._promise;
-    };
-
-    // API Methods
-
-    function MIDIAccess() {
-        this._jazzInstances = new Array();
-        this._jazzInstances.push( new _JazzInstance() );
-        this._promise = new Promise;
-
-        if (this._jazzInstances[0]._Jazz) {
-            this._Jazz = this._jazzInstances[0]._Jazz;
-            window.setTimeout( _onReady.bind(this), 3 );
-        } else {
-            window.setTimeout( _onNotReady.bind(this), 3 );
-        }
-    };
-
-    _onReady = function _onReady() {
-        if (this._promise)
-            this._promise.succeed(this);
-    };
-
-    function _onNotReady() {
-        if (this._promise)
-            this._promise.fail( { code: 1 } );
-    };
-
-    MIDIAccess.prototype.inputs = function(  ) {
-        if (!this._Jazz)
-              return null;
-        var list=this._Jazz.MidiInList();
-        var inputs = new Array( list.length );
-
-        for ( var i=0; i<list.length; i++ ) {
-            inputs[i] = new MIDIInput( this, list[i], i );
-        }
-        return inputs;
-    }
-
-    MIDIAccess.prototype.outputs = function(  ) {
-        if (!this._Jazz)
-            return null;
-        var list=this._Jazz.MidiOutList();
-        var outputs = new Array( list.length );
-
-        for ( var i=0; i<list.length; i++ ) {
-            outputs[i] = new MIDIOutput( this, list[i], i );
-        }
-        return outputs;
-    };
-
-    MIDIInput = function MIDIInput( midiAccess, name, index ) {
-        this._listeners = [];
-        this._midiAccess = midiAccess;
-        this._index = index;
-        this._inLongSysexMessage = false;
-        this._sysexBuffer = new Uint8Array();
-        this.id = "" + index + "." + name;
-        this.manufacturer = "";
-        this.name = name;
-        this.type = "input";
-        this.version = "";
-        this.onmidimessage = null;
-
-        var inputInstance = null;
-        for (var i=0; (i<midiAccess._jazzInstances.length)&&(!inputInstance); i++) {
-            if (!midiAccess._jazzInstances[i].inputInUse)
-                inputInstance=midiAccess._jazzInstances[i];
-        }
-        if (!inputInstance) {
-            inputInstance = new _JazzInstance();
-            midiAccess._jazzInstances.push( inputInstance );
-        }
-        inputInstance.inputInUse = true;
-
-        this._jazzInstance = inputInstance._Jazz;
-        this._input = this._jazzInstance.MidiInOpen( this._index, _midiProc.bind(this) );
-    };
-
-    // Introduced in DOM Level 2:
-    MIDIInput.prototype.addEventListener = function (type, listener, useCapture ) {
-        if (type !== "midimessage")
-            return;
-        for (var i=0; i<this._listeners.length; i++)
-            if (this._listeners[i] == listener)
-                return;
-        this._listeners.push( listener );
-    };
-
-    MIDIInput.prototype.removeEventListener = function (type, listener, useCapture ) {
-        if (type !== "midimessage")
-            return;
-        for (var i=0; i<this._listeners.length; i++)
-            if (this._listeners[i] == listener) {
-                this._listeners.splice( i, 1 );  //remove it
-                return;
-            }
-    };
-
-    MIDIInput.prototype.preventDefault = function() {
-        this._pvtDef = true;
-    };
-
-    MIDIInput.prototype.dispatchEvent = function (evt) {
-        this._pvtDef = false;
-
-        // dispatch to listeners
-        for (var i=0; i<this._listeners.length; i++)
-            if (this._listeners[i].handleEvent)
-                this._listeners[i].handleEvent.bind(this)( evt );
-            else
-                this._listeners[i].bind(this)( evt );
-
-        if (this.onmidimessage)
-            this.onmidimessage( evt );
-
-        return this._pvtDef;
-    };
-
-    MIDIInput.prototype.appendToSysexBuffer = function ( data ) {
-        var oldLength = this._sysexBuffer.length;
-        var tmpBuffer = new Uint8Array( oldLength + data.length );
-        tmpBuffer.set( this._sysexBuffer );
-        tmpBuffer.set( data, oldLength );
-        this._sysexBuffer = tmpBuffer;
-    };
-
-    MIDIInput.prototype.bufferLongSysex = function ( data, initialOffset ) {
-        var j = initialOffset;
-        while (j<data.length) {
-            if (data[j] == 0xF7) {
-                // end of sysex!
-                j++;
-                this.appendToSysexBuffer( data.slice(initialOffset, j) );
-                return j;
-            }
-            j++;
-        }
-        // didn't reach the end; just tack it on.
-        this.appendToSysexBuffer( data.slice(initialOffset, j) );
-        this._inLongSysexMessage = true;
-        return j;
-    };
-
-    _midiProc = function _midiProc( timestamp, data ) {
-        // Have to use createEvent/initEvent because IE10 fails on new CustomEvent.  Thanks, IE!
-        var length = 0;
-        var i,j;
-        var isSysexMessage = false;
-
-        // Jazz sometimes passes us multiple messages at once, so we need to parse them out
-        // and pass them one at a time.
-
-        for (i=0; i<data.length; i+=length) {
-            if (this._inLongSysexMessage) {
-                i = this.bufferLongSysex(data,i);
-                if ( data[i-1] != 0xf7 ) {
-                    // ran off the end without hitting the end of the sysex message
-                    return;
-                }
-                isSysexMessage = true;
-            } 
-            else {
-                isSysexMessage = false;
-                switch (data[i] & 0xF0) {
-                    case 0x80:  // note off
-                    case 0x90:  // note on
-                    case 0xA0:  // polyphonic aftertouch
-                    case 0xB0:  // control change
-                    case 0xE0:  // channel mode
-                        length = 3;
-                        break;
-
-                    case 0xC0:  // program change
-                    case 0xD0:  // channel aftertouch
-                        length = 2;
-                        break;
-
-                    case 0xF0:
-                        switch (data[i]) {
-                            case 0xf0:  // variable-length sysex.
-                                i = this.bufferLongSysex(data,i);
-                                if ( data[i-1] != 0xf7 ) {
-                                    // ran off the end without hitting the end of the sysex message
-                                    return;
-                                }
-                                isSysexMessage = true;
-                                break;
-
-                            case 0xF1:  // MTC quarter frame
-                            case 0xF3:  // song select
-                                length = 2;
-                                break;
-
-                            case 0xF2:  // song position pointer
-                                length = 3;
-                                break;
-
-                            default:
-                                length = 1;
-                                break;
-                        }
-                        break;
-                }
-            }
-            var evt = document.createEvent( "Event" );
-            evt.initEvent( "midimessage", false, false );
-            evt.receivedTime = parseFloat( timestamp.toString()) + this._jazzInstance._perfTimeZero;
-            if (isSysexMessage || this._inLongSysexMessage) {
-                evt.data = new Uint8Array( this._sysexBuffer );
-                this._sysexBuffer.length = 0;
-                this._inLongSysexMessage = false;
-            } else
-                evt.data = new Uint8Array(data.slice(i, length+i));
-            this.dispatchEvent( evt );
-        }
-    };
-
-    MIDIOutput = function MIDIOutput( midiAccess, name, index ) {
-        this._listeners = [];
-        this._midiAccess = midiAccess;
-        this._index = index;
-        this.id = "" + index + "." + name;
-        this.manufacturer = "";
-        this.name = name;
-        this.type = "output";
-        this.version = "";
-
-        var outputInstance = null;
-        for (var i=0; (i<midiAccess._jazzInstances.length)&&(!outputInstance); i++) {
-            if (!midiAccess._jazzInstances[i].outputInUse)
-                outputInstance=midiAccess._jazzInstances[i];
-        }
-        if (!outputInstance) {
-            outputInstance = new _JazzInstance();
-            midiAccess._jazzInstances.push( outputInstance );
-        }
-        outputInstance.outputInUse = true;
-
-        this._jazzInstance = outputInstance._Jazz;
-        this._jazzInstance.MidiOutOpen(this.name);
-    };
-
-    function _sendLater() {
-        this.jazz.MidiOutLong( this.data );    // handle send as sysex
-    }
-
-    MIDIOutput.prototype.send = function( data, timestamp ) {
-        var delayBeforeSend = 0;
-        if (data.length === 0)
-            return false;
-
-        if (timestamp)
-            delayBeforeSend = Math.floor( timestamp - window.performance.now() );
-
-        if (timestamp && (delayBeforeSend>1)) {
-            var sendObj = new Object();
-            sendObj.jazz = this._jazzInstance;
-            sendObj.data = data;
-
-            window.setTimeout( _sendLater.bind(sendObj), delayBeforeSend );
-        } else {
-            this._jazzInstance.MidiOutLong( data );
-        }
-        return true;
-    };
-
-    //init: create plugin
-    if (!window.navigator.requestMIDIAccess)
-        window.navigator.requestMIDIAccess = _requestMIDIAccess;
-
-}(window));
-
-// Polyfill window.performance.now() if necessary.
-(function (exports) {
-    var perf = {},
-        props;
-
-    function findAlt() {
-        var prefix = ['moz', 'webkit', 'o', 'ms'],
-        i = prefix.length,
-            //worst case, we use Date.now()
-            props = {
-                value: (function (start) {
-                    return function () {
-                        return Date.now() - start;
-                    };
-                }(Date.now()))
-            };
-
-        //seach for vendor prefixed version
-        for (; i >= 0; i--) {
-            if ((prefix[i] + "Now") in exports.performance) {
-                props.value = function (method) {
-                    return function () {
-                        exports.performance[method]();
-                    }
-                }(prefix[i] + "Now");
-                return props;
-            }
-        }
-
-        //otherwise, try to use connectionStart
-        if ("timing" in exports.performance && "connectStart" in exports.performance.timing) {
-            //this pretty much approximates performance.now() to the millisecond
-            props.value = (function (start) {
-                return function() {
-                    Date.now() - start;
-                };
-            }(exports.performance.timing.connectStart));
-        }
-        return props;
-    }
-
-    //if already defined, bail
-    if (("performance" in exports) && ("now" in exports.performance))
-        return;
-    if (!("performance" in exports))
-        Object.defineProperty(exports, "performance", {
-            get: function () {
-                return perf;
-            }});
-        //otherwise, performance is there, but not "now()"
-
-    props = findAlt();
-    Object.defineProperty(exports.performance, "now", props);
-}(window));
-
 
  </script>
  <!-- MIDIFile: Repos folder must be in the same parent folder than the MIDIPlayer one -->
  <script id="../../MIDIFile/dist/MIDIFile.js" type="text/javascript">
- (function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.MIDIFile = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
-'use strict';
-
 // MIDIEvents : Read and edit events from various sources (ArrayBuffer, Stream)
 function MIDIEvents() {
   throw new Error('MIDIEvents function not intended to be run.');
@@ -952,9 +518,6 @@ MIDIEvents.getRequiredBufferLength = function(events) {
   return bufferLength;
 };
 
-module.exports = MIDIEvents;
-
-},{}],2:[function(require,module,exports){
 /*! http://mths.be/fromcodepoint v0.2.1 by @mathias */
 if (!String.fromCodePoint) {
 	(function() {
@@ -1017,8 +580,6 @@ if (!String.fromCodePoint) {
 		}
 	}());
 }
-
-},{}],3:[function(require,module,exports){
 /*! http://mths.be/codepointat v0.2.0 by @mathias */
 if (!String.prototype.codePointAt) {
 	(function() {
@@ -1050,7 +611,7 @@ if (!String.prototype.codePointAt) {
 			// Get the first code unit
 			var first = string.charCodeAt(index);
 			var second;
-			if ( // check if itâ€™s the start of a surrogate pair
+			if ( // check if it’s the start of a surrogate pair
 				first >= 0xD800 && first <= 0xDBFF && // high surrogate
 				size > index + 1 // there is a next code unit
 			) {
@@ -1073,14 +634,7 @@ if (!String.prototype.codePointAt) {
 		}
 	}());
 }
-
-},{}],4:[function(require,module,exports){
 // UTF8 : Manage UTF-8 strings in ArrayBuffers
-if(module.require) {
-  require('string.fromcodepoint');
-  require('string.prototype.codepointat');
-}
-
 var UTF8={
   // non UTF8 encoding detection (cf README file for details)
   'isNotUTF8': function(bytes, byteOffset, byteLength) {
@@ -1219,23 +773,7 @@ var UTF8={
     return bytes;
   }
 };
-
-if('undefined' !== typeof module) {
-  module.exports = UTF8;
-}
-
-
-},{"string.fromcodepoint":2,"string.prototype.codepointat":3}],5:[function(require,module,exports){
-'use strict';
-
 // MIDIFile : Read (and soon edit) a MIDI file in a given ArrayBuffer
-
-// Dependencies
-var MIDIFileHeader = require('./MIDIFileHeader');
-var MIDIFileTrack = require('./MIDIFileTrack');
-var MIDIEvents = require('midievents');
-var UTF8 = require('utf-8');
-
 // Constructor
 function MIDIFile(buffer, strictMode) {
   var track;
@@ -1541,11 +1079,6 @@ MIDIFile.prototype.getContent = function() {
 MIDIFile.Header = MIDIFileHeader;
 MIDIFile.Track = MIDIFileTrack;
 
-module.exports = MIDIFile;
-
-},{"./MIDIFileHeader":6,"./MIDIFileTrack":7,"midievents":1,"utf-8":4}],6:[function(require,module,exports){
-'use strict';
-
 // MIDIFileHeader : Read and edit a MIDI header chunk in a given ArrayBuffer
 function MIDIFileHeader(buffer) {
   var a;
@@ -1689,11 +1222,6 @@ MIDIFileHeader.prototype.setSMTPEDivision = function(smpteFrames, ticksPerFrame)
   this.datas.setUint8(13, ticksPerFrame);
 };
 
-module.exports = MIDIFileHeader;
-
-},{}],7:[function(require,module,exports){
-'use strict';
-
 // MIDIFileTrack : Read and edit a MIDI track chunk in a given ArrayBuffer
 function MIDIFileTrack(buffer, start) {
   var a;
@@ -1803,530 +1331,9 @@ MIDIFileTrack.prototype.setTrackContent = function(dataView) {
     destination[i] = origin[i];
   }
 };
-
-module.exports = MIDIFileTrack;
-
-},{}]},{},[5])(5)
-});
- </script>
+</script>
  <!-- MIDIPlayer -->
  <script id="../dist/MIDIPlayer.js" type="text/javascript">
- (function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.MIDIPlayer = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
-'use strict';
-
-// MIDIEvents : Read and edit events from various sources (ArrayBuffer, Stream)
-function MIDIEvents() {
-  throw new Error('MIDIEvents function not intended to be run.');
-}
-
-// Static constants
-// Event types
-MIDIEvents.EVENT_META = 0xFF;
-MIDIEvents.EVENT_SYSEX = 0xF0;
-MIDIEvents.EVENT_DIVSYSEX = 0xF7;
-MIDIEvents.EVENT_MIDI = 0x8;
-// Meta event types
-MIDIEvents.EVENT_META_SEQUENCE_NUMBER = 0x00;
-MIDIEvents.EVENT_META_TEXT = 0x01;
-MIDIEvents.EVENT_META_COPYRIGHT_NOTICE = 0x02;
-MIDIEvents.EVENT_META_TRACK_NAME = 0x03;
-MIDIEvents.EVENT_META_INSTRUMENT_NAME = 0x04;
-MIDIEvents.EVENT_META_LYRICS = 0x05;
-MIDIEvents.EVENT_META_MARKER = 0x06;
-MIDIEvents.EVENT_META_CUE_POINT = 0x07;
-MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX = 0x20;
-MIDIEvents.EVENT_META_END_OF_TRACK = 0x2F;
-MIDIEvents.EVENT_META_SET_TEMPO = 0x51;
-MIDIEvents.EVENT_META_SMTPE_OFFSET = 0x54;
-MIDIEvents.EVENT_META_TIME_SIGNATURE = 0x58;
-MIDIEvents.EVENT_META_KEY_SIGNATURE = 0x59;
-MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC = 0x7F;
-// MIDI event types
-MIDIEvents.EVENT_MIDI_NOTE_OFF = 0x8;
-MIDIEvents.EVENT_MIDI_NOTE_ON = 0x9;
-MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH = 0xA;
-MIDIEvents.EVENT_MIDI_CONTROLLER = 0xB;
-MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE = 0xC;
-MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH = 0xD;
-MIDIEvents.EVENT_MIDI_PITCH_BEND = 0xE;
-// MIDI event sizes
-MIDIEvents.MIDI_1PARAM_EVENTS = [
-  MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE,
-  MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH,
-];
-MIDIEvents.MIDI_2PARAMS_EVENTS = [
-  MIDIEvents.EVENT_MIDI_NOTE_OFF,
-  MIDIEvents.EVENT_MIDI_NOTE_ON,
-  MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH,
-  MIDIEvents.EVENT_MIDI_CONTROLLER,
-  MIDIEvents.EVENT_MIDI_PITCH_BEND,
-];
-
-// Create an event stream parser
-MIDIEvents.createParser = function midiEventsCreateParser(stream, startAt, strictMode) {
-  // Private vars
-  // Common vars
-  var eventTypeByte;
-  var event;
-  // MIDI events vars
-  var MIDIEventType;
-  var MIDIEventChannel;
-  var MIDIEventParam1;
-
-  // Wrap DataView into a data stream
-  if(stream instanceof DataView) {
-    stream = {
-      position: startAt || 0,
-      buffer: stream,
-      readUint8: function() {
-        return this.buffer.getUint8(this.position++);
-      },
-      readUint16: function() {
-        var v = this.buffer.getUint16(this.position);
-        this.position = this.position + 2;
-        return v;
-      },
-      readUint32: function() {
-        var v = this.buffer.getUint16(this.position);
-        this.position = this.position + 2;
-        return v;
-      },
-      readVarInt: function() {
-        var v = 0;
-        var i = 0;
-        var b;
-
-        while(4 > i++) {
-          b = this.readUint8();
-
-          if (b & 0x80) {
-            v += (b & 0x7f);
-            v <<= 7;
-          } else {
-            return v + b;
-          }
-        }
-        throw new Error('0x' + this.position.toString(16) + ':' +
-          ' Variable integer length cannot exceed 4 bytes');
-      },
-      readBytes: function(length) {
-        var bytes = [];
-
-        for(; 0 < length; length--) {
-          bytes.push(this.readUint8());
-        }
-        return bytes;
-      },
-      pos: function() {
-        return '0x' + (this.buffer.byteOffset + this.position).toString(16);
-      },
-      end: function() {
-        return this.position === this.buffer.byteLength;
-      },
-    };
-    startAt = 0;
-  }
-  // Consume stream till not at start index
-  if(0 < startAt) {
-    while(startAt--) {
-      stream.readUint8();
-    }
-  }
-  // creating the parser object
-  return {
-    // Read the next event
-    next: function() {
-      // Check available datas
-      if(stream.end()) {
-        return null;
-      }
-      // Creating the event
-      event = {
-        // Memoize the event index
-        index: stream.pos(),
-        // Read the delta time
-        delta: stream.readVarInt(),
-      };
-      // Read the eventTypeByte
-      eventTypeByte = stream.readUint8();
-      if(0xF0 === (eventTypeByte & 0xF0)) {
-        // Meta events
-        if(eventTypeByte === MIDIEvents.EVENT_META) {
-          event.type = MIDIEvents.EVENT_META;
-          event.subtype = stream.readUint8();
-          event.length = stream.readVarInt();
-          switch(event.subtype) {
-            case MIDIEvents.EVENT_META_SEQUENCE_NUMBER:
-              if(strictMode && 2 !== event.length) {
-                throw new Error(stream.pos() + ' Bad metaevent length.');
-              }
-              event.msb = stream.readUint8();
-              event.lsb = stream.readUint8();
-              return event;
-            case MIDIEvents.EVENT_META_TEXT:
-            case MIDIEvents.EVENT_META_COPYRIGHT_NOTICE:
-            case MIDIEvents.EVENT_META_TRACK_NAME:
-            case MIDIEvents.EVENT_META_INSTRUMENT_NAME:
-            case MIDIEvents.EVENT_META_LYRICS:
-            case MIDIEvents.EVENT_META_MARKER:
-            case MIDIEvents.EVENT_META_CUE_POINT:
-              event.data = stream.readBytes(event.length);
-              return event;
-            case MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX:
-              if(strictMode && 1 !== event.length) {
-                throw new Error(stream.pos() + ' Bad metaevent length.');
-              }
-              event.prefix = stream.readUint8();
-              return event;
-            case MIDIEvents.EVENT_META_END_OF_TRACK:
-              if(strictMode && 0 !== event.length) {
-                throw new Error(stream.pos() + ' Bad metaevent length.');
-              }
-              return event;
-            case MIDIEvents.EVENT_META_SET_TEMPO:
-              if(strictMode && 3 !== event.length) {
-                throw new Error(stream.pos() + ' Tempo meta event length must be 3.');
-              }
-              event.tempo = (
-                (stream.readUint8() << 16) +
-                (stream.readUint8() << 8) +
-                stream.readUint8()
-              );
-              event.tempoBPM = 60000000 / event.tempo;
-              return event;
-            case MIDIEvents.EVENT_META_SMTPE_OFFSET:
-              if(strictMode && 5 !== event.length) {
-                throw new Error(stream.pos() + ' Bad metaevent length.');
-              }
-              event.hour = stream.readUint8();
-              if(strictMode && 23 < event.hour) {
-                throw new Error(stream.pos() + ' SMTPE offset hour value must' +
-                  ' be part of 0-23.');
-              }
-              event.minutes = stream.readUint8();
-              if(strictMode && 59 < event.minutes) {
-                throw new Error(stream.pos() + ' SMTPE offset minutes value' +
-                  ' must be part of 0-59.');
-              }
-              event.seconds = stream.readUint8();
-              if(strictMode && 59 < event.seconds) {
-                throw new Error(stream.pos() + ' SMTPE offset seconds value' +
-                  ' must be part of 0-59.');
-              }
-              event.frames = stream.readUint8();
-              if(strictMode && 30 < event.frames) {
-                throw new Error(stream.pos() + ' SMTPE offset frames value must' +
-                  ' be part of 0-30.');
-              }
-              event.subframes = stream.readUint8();
-              if(strictMode && 99 < event.subframes) {
-                throw new Error(stream.pos() + ' SMTPE offset subframes value' +
-                  ' must be part of 0-99.');
-              }
-              return event;
-            case MIDIEvents.EVENT_META_KEY_SIGNATURE:
-              if(strictMode && 2 !== event.length) {
-                throw new Error(stream.pos() + ' Bad metaevent length.');
-              }
-              event.key = stream.readUint8();
-              if(strictMode && (-7 > event.key || 7 < event.key)) {
-                throw new Error(stream.pos() + ' Bad metaevent length.');
-              }
-              event.scale = stream.readUint8();
-              if(strictMode && 0 !== event.scale && 1 !== event.scale) {
-                throw new Error(stream.pos() + ' Key signature scale value must' +
-                  ' be 0 or 1.');
-              }
-              return event;
-            case MIDIEvents.EVENT_META_TIME_SIGNATURE:
-              if(strictMode && 4 !== event.length) {
-                throw new Error(stream.pos() + ' Bad metaevent length.');
-              }
-              event.data = stream.readBytes(event.length);
-              event.param1 = event.data[0];
-              event.param2 = event.data[1];
-              event.param3 = event.data[2];
-              event.param4 = event.data[3];
-              return event;
-            case MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC:
-              event.data = stream.readBytes(event.length);
-              return event;
-            default:
-              if(strictMode) {
-                throw new Error(stream.pos() + ' Unknown meta event type ' +
-                  '(' + event.subtype.toString(16) + ').');
-              }
-              event.data = stream.readBytes(event.length);
-              return event;
-          }
-        // System events
-        } else if(eventTypeByte === MIDIEvents.EVENT_SYSEX ||
-            eventTypeByte === MIDIEvents.EVENT_DIVSYSEX) {
-          event.type = eventTypeByte;
-          event.length = stream.readVarInt();
-          event.data = stream.readBytes(event.length);
-          return event;
-        // Unknown event, assuming it's system like event
-        } else {
-          if(strictMode) {
-            throw new Error(stream.pos() + ' Unknown event type ' +
-              eventTypeByte.toString(16) + ', Delta: ' + event.delta + '.');
-          }
-          event.type = eventTypeByte;
-          event.badsubtype = stream.readVarInt();
-          event.length = stream.readUint8();
-          event.data = stream.readBytes(event.length);
-          return event;
-        }
-      // MIDI eventsdestination[index++]
-      } else {
-        // running status
-        if(0 === (eventTypeByte & 0x80)) {
-          if(!(MIDIEventType)) {
-            throw new Error(stream.pos() + ' Running status without previous event');
-          }
-          MIDIEventParam1 = eventTypeByte;
-        } else {
-          MIDIEventType = eventTypeByte >> 4;
-          MIDIEventChannel = eventTypeByte & 0x0F;
-          MIDIEventParam1 = stream.readUint8();
-        }
-        event.type = MIDIEvents.EVENT_MIDI;
-        event.subtype = MIDIEventType;
-        event.channel = MIDIEventChannel;
-        event.param1 = MIDIEventParam1;
-        switch(MIDIEventType) {
-          case MIDIEvents.EVENT_MIDI_NOTE_OFF:
-            event.param2 = stream.readUint8();
-            return event;
-          case MIDIEvents.EVENT_MIDI_NOTE_ON:
-            event.param2 = stream.readUint8();
-
-            // If velocity is 0, it's a note off event in fact
-            if(!event.param2) {
-              event.subtype = MIDIEvents.EVENT_MIDI_NOTE_OFF;
-              event.param2 = 127; // Find a standard telling what to do here
-            }
-            return event;
-          case MIDIEvents.EVENT_MIDI_NOTE_AFTERTOUCH:
-            event.param2 = stream.readUint8();
-            return event;
-          case MIDIEvents.EVENT_MIDI_CONTROLLER:
-            event.param2 = stream.readUint8();
-            return event;
-          case MIDIEvents.EVENT_MIDI_PROGRAM_CHANGE:
-            return event;
-          case MIDIEvents.EVENT_MIDI_CHANNEL_AFTERTOUCH:
-            return event;
-          case MIDIEvents.EVENT_MIDI_PITCH_BEND:
-            event.param2 = stream.readUint8();
-            return event;
-          default:
-            if(strictMode) {
-              throw new Error(stream.pos() + ' Unknown MIDI event type ' +
-                '(' + MIDIEventType.toString(16) + ').');
-            }
-            return event;
-        }
-      }
-    },
-  };
-};
-
-// Return the buffer length needed to encode the given events
-MIDIEvents.writeToTrack = function midiEventsWriteToTrack(events, destination, strictMode) {
-  var index = 0;
-  var i;
-  var j;
-  var k;
-  var l;
-
-  // Converting each event to binary MIDI datas
-  for(i = 0, j = events.length; i < j; i++) {
-    // Writing delta value
-    if(events[i].delta >>> 28) {
-      throw Error('Event #' + i + ': Maximum delta time value reached (' +
-        events[i].delta + '/134217728 max)');
-    }
-    if(events[i].delta >>> 21) {
-      destination[index++] = ((events[i].delta >>> 21) & 0x7F) | 0x80;
-    }
-    if(events[i].delta >>> 14) {
-      destination[index++] = ((events[i].delta >>> 14) & 0x7F) | 0x80;
-    }
-    if(events[i].delta >>> 7) {
-      destination[index++] = ((events[i].delta >>> 7) & 0x7F) | 0x80;
-    }
-    destination[index++] = (events[i].delta & 0x7F);
-    // MIDI Events encoding
-    if(events[i].type === MIDIEvents.EVENT_MIDI) {
-      // Adding the byte of subtype + channel
-      destination[index++] = (events[i].subtype << 4) + events[i].channel;
-      // Adding the byte of the first params
-      destination[index++] = events[i].param1;
-      // Adding a byte for the optionnal second param
-      if(-1 !== MIDIEvents.MIDI_2PARAMS_EVENTS.indexOf(events[i].subtype)) {
-        destination[index++] = events[i].param2;
-      }
-    // META / SYSEX events encoding
-    } else {
-      // Adding the event type byte
-      destination[index++] = events[i].type;
-      // Adding the META event subtype byte
-      if(events[i].type === MIDIEvents.EVENT_META) {
-        destination[index++] = events[i].subtype;
-      }
-      // Writing the event length bytes
-      if(events[i].length >>> 28) {
-        throw Error('Event #' + i + ': Maximum length reached (' +
-          events[i].length + '/134217728 max)');
-      }
-      if(events[i].length >>> 21) {
-        destination[index++] = ((events[i].length >>> 21) & 0x7F) | 0x80;
-      }
-      if(events[i].length >>> 14) {
-        destination[index++] = ((events[i].length >>> 14) & 0x7F) | 0x80;
-      }
-      if(events[i].length >>> 7) {
-        destination[index++] = ((events[i].length >>> 7) & 0x7F) | 0x80;
-      }
-      destination[index++] = (events[i].length & 0x7F);
-      if(events[i].type === MIDIEvents.EVENT_META) {
-        switch(events[i].subtype) {
-          case MIDIEvents.EVENT_META_SEQUENCE_NUMBER:
-            destination[index++] = events[i].msb;
-            destination[index++] = events[i].lsb;
-            break;
-          case MIDIEvents.EVENT_META_TEXT:
-          case MIDIEvents.EVENT_META_COPYRIGHT_NOTICE:
-          case MIDIEvents.EVENT_META_TRACK_NAME:
-          case MIDIEvents.EVENT_META_INSTRUMENT_NAME:
-          case MIDIEvents.EVENT_META_LYRICS:
-          case MIDIEvents.EVENT_META_MARKER:
-          case MIDIEvents.EVENT_META_CUE_POINT:
-            for(k = 0, l = events[i].length; k < l; k++) {
-              destination[index++] = events[i].data[k];
-            }
-            break;
-          case MIDIEvents.EVENT_META_MIDI_CHANNEL_PREFIX:
-            destination[index++] = events[i].prefix;
-            break;
-          case MIDIEvents.EVENT_META_END_OF_TRACK:
-            break;
-          case MIDIEvents.EVENT_META_SET_TEMPO:
-            destination[index++] = (events[i].tempo >> 16);
-            destination[index++] = (events[i].tempo >> 8) & 0xFF;
-            destination[index++] = events[i].tempo & 0xFF;
-            break;
-          case MIDIEvents.EVENT_META_SMTPE_OFFSET:
-            if(strictMode && 23 < events[i].hour) {
-              throw new Error('Event #' + i + ': SMTPE offset hour value must be' +
-                ' part of 0-23.');
-            }
-            destination[index++] = events[i].hour;
-            if(strictMode && 59 < events[i].minutes) {
-              throw new Error('Event #' + i + ': SMTPE offset minutes value must' +
-                ' be part of 0-59.');
-            }
-            destination[index++] = events[i].minutes;
-            if(strictMode && 59 < events[i].seconds) {
-              throw new Error('Event #' + i + ': SMTPE offset seconds value must' +
-                ' be part of 0-59.');
-            }
-            destination[index++] = events[i].seconds;
-            if(strictMode && 30 < events[i].frames) {
-              throw new Error('Event #' + i + ': SMTPE offset frames amount must' +
-                ' be part of 0-30.');
-            }
-            destination[index++] = events[i].frames;
-            if(strictMode && 99 < events[i].subframes) {
-              throw new Error('Event #' + i + ': SMTPE offset subframes amount' +
-                ' must be part of 0-99.');
-            }
-            destination[index++] = events[i].subframes;
-            break;
-          case MIDIEvents.EVENT_META_KEY_SIGNATURE:
-            if('number' != typeof events[i].key || -7 > events[i].key ||
-              7 < events[i].scale) {
-              throw new Error('Event #' + i + ':The key signature key must be' +
-                ' between -7 and 7');
-            }
-            if('number' !== typeof events[i].scale ||
-              0 > events[i].scale || 1 < events[i].scale) {
-              throw new Error('Event #' + i + ':' +
-              'The key signature scale must be 0 or 1');
-            }
-            destination[index++] = events[i].key;
-            destination[index++] = events[i].scale;
-            break;
-          // Not implemented
-          case MIDIEvents.EVENT_META_TIME_SIGNATURE:
-          case MIDIEvents.EVENT_META_SEQUENCER_SPECIFIC:
-          default:
-            for(k = 0, l = events[i].length; k < l; k++) {
-              destination[index++] = events[i].data[k];
-            }
-            break;
-        }
-      // Adding bytes corresponding to the sysex event datas
-      } else {
-        for(k = 0, l = events[i].length; k < l; k++) {
-          destination[index++] = events[i].data[k];
-        }
-      }
-    }
-  }
-};
-
-// Return the buffer length needed to encode the given events
-MIDIEvents.getRequiredBufferLength = function(events) {
-  var bufferLength = 0;
-  var i = 0;
-  var j;
-
-  // Calculating the track size by adding events lengths
-  for(i = 0, j = events.length; i < j; i++) {
-    // Computing necessary bytes to encode the delta value
-    bufferLength +=
-      events[i].delta >>> 21 ? 4 :
-        events[i].delta >>> 14 ? 3 :
-          events[i].delta >>> 7 ? 2 : 1;
-    // MIDI Events have various fixed lengths
-    if(events[i].type === MIDIEvents.EVENT_MIDI) {
-      // Adding a byte for subtype + channel
-      bufferLength++;
-      // Adding a byte for the first params
-      bufferLength++;
-      // Adding a byte for the optionnal second param
-      if(-1 !== MIDIEvents.MIDI_2PARAMS_EVENTS.indexOf(events[i].subtype)) {
-        bufferLength++;
-      }
-    // META / SYSEX events lengths are self defined
-    } else {
-      // Adding a byte for the event type
-      bufferLength++;
-      // Adding a byte for META events subtype
-      if(events[i].type === MIDIEvents.EVENT_META) {
-        bufferLength++;
-      }
-      // Adding necessary bytes to encode the length
-      bufferLength +=
-        events[i].length >>> 21 ? 4 :
-          events[i].length >>> 14 ? 3 :
-            events[i].length >>> 7 ? 2 : 1;
-      // Adding bytes corresponding to the event length
-      bufferLength += events[i].length;
-    }
-  }
-  return bufferLength;
-};
-
-module.exports = MIDIEvents;
-
-},{}],2:[function(require,module,exports){
-'use strict';
-
-var MIDIEvents = require('midievents');
 
 // Constants
 var PLAY_BUFFER_DELAY = 300;
@@ -2450,10 +1457,6 @@ MIDIPlayer.prototype.stop = function() {
   return false;
 };
 
-module.exports = MIDIPlayer;
-
-},{"midievents":1}]},{},[2])(2)
-});
  </script>
  
  <script>
@@ -2608,13 +1611,7 @@ MIDILyricsDisplayer.prototype.setTextSize = function(event, params) {
 	}
 };
 
-//module.exports = MIDILyricsDisplayer;
-
-
- 
  </script>
-
-    <!--link rel="stylesheet" type="text/css" href="styles.css"-->
     <style>
     /*! normalize.css v2.1.3 | MIT License | git.io/normalize */
     article,aside,details,figcaption,figure,footer,header,hgroup,main,nav,section,summary{display:block}
@@ -3597,6 +2594,7 @@ function guessSong(n){
 		Album: album
 	}
 }
+
     </script>
     <script>
       //beware! this code is pretty hacky and  ugly.
@@ -3619,6 +2617,15 @@ function guessSong(n){
         if
       };
       */
+      function GetLyrics(fileIn){
+        ID3v2.parseURL(fileIn,render_song);
+
+        function render_song(tags){
+	        var lirik=tags['Unsychronized lyric/text transcription']?tags['Unsychronized lyric/text transcription'].substr(3):'';
+          return lirik
+        };
+        return
+      }
       function parseFile(file, callback){
         if(localStorage[file.name]) 
           return callback(JSON.parse(localStorage[file.name]));
@@ -3629,6 +2636,7 @@ function guessSong(n){
             Artist: tags.Artist,
             Album: tags.Album,
             Genre: tags.Genre
+            
           });
           callback(tags);
         })
@@ -3824,8 +2832,11 @@ function guessSong(n){
                     /////////////////////////////////////
                     //document.title=tags.Title || t2.Title;
                     //document.title=f.name;
+                    document.title="";
                     documentTitle(f.name,300,15)
                     playIndicator(f.name||tags.Artist+"-"+tags.Title||t2.Artist+"-"+t2.Title);
+                    console.log(tags.Lyrics||t2.Lyrics);
+                    console.log(GetLyrics(f))
                     
                   }
                 }
@@ -3904,20 +2915,22 @@ function guessSong(n){
           $("support").innerHTML += "Your browser does not support Ogg Vorbis Playback<br>";
         if(!(a.canPlayType && a.canPlayType('audio/mpeg;').replace(/no/, ''))) 
           $("support").innerHTML += "Your browser does not support MP3 Playback<br>";
+
+        var d = document.createElement('input');
+        d.id='InpDir';
+        d.type = 'file';
+
         var f = document.createElement('input');
+        f.id='InpFile';
         f.type = 'file';
-        if(!('multiple' in f)) 
-          $("support").innerHTML += "Your browser does not support selecting multiple files<br>";
-        if(!('webkitdirectory' in f)) 
-          $("support").innerHTML += "Your browser probably does not support selecting directories<br>";
-        if(window.createObjectURL){
-        }
-        else if(window.createBlobURL){
-        }
+        
+        if(!('multiple' in d)||!('multiple' in f)) $("support").innerHTML += "Your browser does not support selecting multiple files<br>";
+        if(!('webkitdirectory' in d)) $("support").innerHTML += "Your browser probably does not support selecting directories<br>";
+        if(window.createObjectURL){}
+        else if(window.createBlobURL){}
         else if(window.URL && window.URL.createObjectURL){
         }
-        else if(window.webkitURL && window.webkitURL.createObjectURL){
-        }
+        else if(window.webkitURL && window.webkitURL.createObjectURL){}
         else{
           $("support").innerHTML += "Your browser probably does not support Object URLs<br>";
         }
@@ -3942,7 +2955,14 @@ function guessSong(n){
       <p style="padding: 15px">
           Select your folder, search your songs, create a plalist and listen to your tracks!
         </p>
-          <input type="file" webkitdirectory directory multiple mozdirectory onchange="getSongs(this.files)">
+        <button><label for="InpDir"><span class="icon icon-paper">Dirs</span></label></button>
+        <input id="InpDir" style="display:none" type="file" webkitdirectory directory multiple mozdirectory onchange="getSongs(this.files)">
+        <!-- <p style="padding-left: 15px">
+          By <a href="http://twitter.com/antimatter15">@antimatter15</a> &amp; UI built by <a href="http://twitter.com/nicovanzyl">@nicovanzyl</a>
+        </p> -->
+        <button><label for="InpFile"><span class="icon icon-paper">Files</span></label></button>
+        <input id="InpFile" style="display:none" type="file" multiple mozdirectory onchange="getSongs(this.files)">
+
       </div>
       <div id="support" style="position:absolute;z-index:99999;color:red;font-size:x-large"> <!-- insert cheap knockoff modernizer clone -->
       
@@ -3964,12 +2984,18 @@ function guessSong(n){
       
       <button onclick="shuffle()">Shuffle</button>
       <button onclick="empty()">Clear</button>
-      <a><input type="file" webkitdirectory directory multiple mozdirectory onchange="getSongs(this.files)"> </a>
+      <a>
+        <button><label for="InpDir"><span class="icon icon-paper">Dirs</span></label></button>
+        <input id="InpDir" style="display:none" type="file" webkitdirectory directory multiple mozdirectory onchange="getSongs(this.files)">
+        <button><label for="InpFile"><span class="icon icon-paper">Files</span></label></button>
+        <input id="InpFile" style="display:none" type="file" multiple mozdirectory onchange="getSongs(this.files)">
+      </a>
       
 		  <div id='midiPanel'>
 		  <p>
-			  <label>Pick a MIDI file:
-			  <input type="file" onchange="stop();readFile(this)" accept="audio/x-midi" /></label><br />
+        <button><label for="midiIn"><span class="icon icon-paper">Midi File Open</span></label></button>
+			  <!--label>Pick a MIDI file:-->
+			  <input id="midiIn" style="display:none" type="file" onchange="stop();readFile(this)" accept="audio/x-midi" /><!--/label--><br />
         <button type="button" onclick="run()">Play</button>
         <button type="button" onclick="stop()">Stop</button>
       
@@ -4059,7 +3085,8 @@ function guessSong(n){
 				playFile(event.target.result);
         midientri=event.target.result;
         //document.title=input.files[0].name;
-        documentTitle(input.files[0].name,300,15)
+        document.title="";
+        documentTitle(input.files[0].name)
    		}
    	}
     //////////////////////
@@ -4153,47 +3180,19 @@ function guessSong(n){
 	    if (params>100) vol=100;
 		  obj.volume=vol;
     };
- 
-    
-function documentTitle(CurrentTitle,selang,banyakhuruf){
-  function MovingTitle(writeText, interval, visibleLetters) {
-    var _instance = {};
 
-    var _currId = 0;
-    var _numberOfLetters = writeText.length;
-
-    function updateTitle() {
-        document.title='';
-        _currId += 1;
-        if(_currId > _numberOfLetters - 1) {
-            _currId = 0; 
-        }
-
-        var startId = _currId;
-        var endId = startId + visibleLetters;
-        var finalText;
-        if(endId < _numberOfLetters - 1) {
-            finalText = writeText.substring(startId, endId);
-        } else {
-            var cappedEndId = _numberOfLetters;
-            endId = endId - cappedEndId;
-
-            finalText = writeText.substring(startId, cappedEndId) +     writeText.substring(0, endId);
-        }
-
-        document.title = finalText; 
-    }
-
-    _instance.init = function() {
-        setInterval(updateTitle, interval);
-    };
-
-    return _instance;
-  }
-//var title = new MovingTitle("Desired title... ", 300, 10);
-var title = new MovingTitle(CurrentTitle+" --- ",selang,banyakhuruf);
-title.init();
-}
+/*****************************/
+var titleDoc;    
+function docTitle() {
+ titleDoc = titleDoc.substring(1, titleDoc.length) + titleDoc.substring(0, 1);
+ document.title = titleDoc;
+ setTimeout("docTitle()", 400);
+};
+function documentTitle(FILENAME) {
+  titleDoc=FILENAME+"--***--";
+  docTitle();
+};
+  
 </script>
   </body>
 </html>
