@@ -3107,7 +3107,14 @@ function guessSong(n){
    
      
 		function downloadFile(url) {
-    midientri=null;
+    
+       midientri=null;
+       if(midiPlayer) {
+				midiPlayer.stop();
+        lyricsDisplayer.stop()
+		    panic();
+      }
+      
 		//	if(!input.value)
 		//		return;
 			var oReq = new XMLHttpRequest();
